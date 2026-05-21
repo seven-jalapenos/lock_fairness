@@ -1,17 +1,12 @@
 
-from typing import List
 import numpy as np
 import pandas as pd
 
-
 class LogAnalyzer:
 
-    def __init__(self, data: pd.DataFrame, global_timeline: pd.DataFrame=None):
+    def __init__(self, data: pd.DataFrame, global_timeline: pd.DataFrame):
         self._data = data
-        if not global_timeline:
-            self._global_timeline = self.create_global_timeline(data)
-        else:
-            self._global_timeline = global_timeline
+        self._global_timeline = global_timeline
     
         self.overtake_metrics = None
     
@@ -26,64 +21,14 @@ class LogAnalyzer:
 #
 #####################################################
 
-
     @staticmethod
-    def create_global_timeline(df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Converts a flat lock event DataFrame into a chronological global timeline.
-        """
-        if df.empty:
-            return pd.DataFrame()
-
-        # 1. 'Melt' the three timestamp columns into a single chronological column
-        timeline_df = df.melt(
-            id_vars=['thread_id'],                                # Keep thread_id as is
-            value_vars=['invocation', 'acquisition', 'release'],  # Columns to stack
-            var_name='event_type',                                # New column holding the old column names
-            value_name='timestamp'                                # New column holding the actual timestamps
-        )
-        
-        # 2. Sort the entire dataframe chronologically by timestamp
-        timeline_df = timeline_df.sort_values(by='timestamp', ignore_index=True)
-        
-        return timeline_df
-    
-    # def create_global_timeline(data: List[np.ndarray]) -> np.ndarray:
-    #     timeline_dtype = np.dtype([
-    #         ('timestamp', 'u8'),
-    #         ('thread_id', 'u4'),
-    #         ('event_type', 'U10')
-    #     ])
-        
-    #     # 1. Pre-calculate total size
-    #     total_entries = sum(len(thread['data']) for thread in data) * 3
-        
-    #     # 2. Pre-allocate the array
-    #     timeline_array = np.empty(total_entries, dtype=timeline_dtype)
-        
-    #     # 3. Fill by index
-    #     idx = 0
-    #     for thread in data:
-    #         tid = thread['thread_id']
-    #         for entry in thread['data']:
-    #             timeline_array[idx] = (entry['invocation'], tid, 'invocation')
-    #             timeline_array[idx+1] = (entry['acquisition'], tid, 'acquisition')
-    #             timeline_array[idx+2] = (entry['release'], tid, 'release')
-    #             idx += 3
-                
-    #     # 4. Sort in place (more memory efficient)
-    #     timeline_array.sort(order='timestamp')
-    #     return timeline_array
-
-
-    @staticmethod
-    def create_overtake_timeline(self) -> np.ndarray:
+    def create_overtake_timeline(global_timeline: pd.DataFrame) -> np.ndarray:
         """
         Creates an operation-wise timeline of overtakes
         operations are ordered based on invocation time
         """
 
-        timeline = self._global_timeline
+        timeline = global_timeline
         # 1. Create the cumulative sum of all acquisitions
         is_acq = (timeline['event_type'] == 'acquisition').astype(int)
         acq_cumsum = np.cumsum(is_acq)

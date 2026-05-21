@@ -4,7 +4,8 @@ import subprocess
 from itertools import product
 import gc
 
-from analysis import LogParser, LogAnalyzer, DataExporter
+from analysis import LogParser, DataExporter
+from analysis import create_global_timeline
 
 param_space = {
     'lock': ['mcs', 'clh', 'ticket', 'ttas', 'ttas_b'],
@@ -59,15 +60,19 @@ class Runner:
         print("done")
         print("parsing logs...")
         log_parser = LogParser(out_file, offset_file_path, int(pin))
-        log_analyzer = LogAnalyzer(log_parser.all_threads_data)
+        global_timeline = create_global_timeline(log_parser.all_threads_data)
 
         print(f"writing raw data to {self.csv_dir} ...")
-        csv_writer = DataExporter(log_analyzer, self.csv_dir, self.iteration_name)
-        csv_writer.write_raw()
+        pqt_writer = DataExporter(
+            log_parser.all_threads_data,
+            global_timeline,
+            self.csv_dir,
+            self.iteration_name
+        )
+        pqt_writer.write_raw()
 
         del log_parser
-        del log_analyzer
-        del csv_writer
+        del pqt_writer
         gc.collect()
 
 def run_permutations():

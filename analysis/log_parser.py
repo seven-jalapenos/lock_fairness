@@ -72,56 +72,6 @@ class LogParser:
         final_df = pd.concat(thread_dfs, ignore_index=True)
         return final_df
 
-    # def parse_logs(self) -> list:
-    #     # Define the LogEntry structure (3 x uint64_t)
-    #     # 'u8' stands for unsigned 8-byte integer
-    #     log_entry_dtype = np.dtype([
-    #         ('invocation', 'u8'),
-    #         ('acquisition', 'u8'),
-    #         ('release', 'u8')
-    #     ])
-        
-    #     # size_t is usually 8 bytes on 64-bit systems
-    #     size_t_dtype = np.dtype('u8')
-
-    #     all_threads = []
-
-    #     if not os.path.exists(self.file_path):
-    #         print(f"Error: {self.file_path} not found.")
-    #         return None
-        
-    #     with open(self.file_path, 'rb') as f:
-    #         thread_id = 0
-    #         while True:
-    #             # 1. Read the number of entries (size_t)
-    #             size_data = np.fromfile(f, dtype=size_t_dtype, count=1)
-    #             if size_data.size == 0:
-    #                 break
-                
-    #             num_entries = size_data[0]
-                
-    #             # 2. Read all LogEntries for this thread in one block
-    #             data = np.fromfile(f, dtype=log_entry_dtype, count=num_entries)
-                
-    #             tmp = {
-    #                 'thread_id': thread_id,
-    #                 'data': data
-    #             }
-
-    #             tmp = self.calibrate_log(tmp, self.offset_table, self.pinning_policy)
-
-    #             wait_times = tmp['data']['acquisition'] - tmp['data']['invocation']
-    #             hold_times = tmp['data']['release'] - tmp['data']['acquisition']
-
-    #             tmp['wait_times'] = wait_times
-    #             tmp['hold_times'] = hold_times
-
-    #             all_threads.append(tmp)
-
-    #             thread_id += 1
-        
-    #     return all_threads
-
     # TODO: implement pinning policy 3
     def calibrate_log(self, thread_data: dict, offset_table: np.ndarray, pinning_policy: int) -> dict:
         """
@@ -155,4 +105,29 @@ class LogParser:
         thread_data['data']['release']     -= int(offset)
         
         return thread_data
+
+
+#########################
+#
+#     Global Timeline
+#
+#########################
+
+def create_global_timeline(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Converts a flat lock event DataFrame into a chronological global timeline.
+    """
+    if df.empty:
+        return pd.DataFrame()
+    # 1. 'Melt' the three timestamp columns into a single chronological column
+    timeline_df = df.melt(
+        id_vars=['thread_id'],                                # Keep thread_id as is
+        value_vars=['invocation', 'acquisition', 'release'],  # Columns to stack
+        var_name='event_type',                                # New column holding the old column names
+        value_name='timestamp'                                # New column holding the actual timestamps
+    )
     
+    # 2. Sort the entire dataframe chronologically by timestamp
+    timeline_df = timeline_df.sort_values(by='timestamp', ignore_index=True)
+    
+    return timeline_df
