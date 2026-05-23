@@ -61,3 +61,10 @@
         /batch2
         ...
  
+
+## left to do 
+
+finish metrics / metric averager
+metric csv writer
+aggragate metrics
+figure drawer

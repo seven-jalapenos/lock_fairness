@@ -2,127 +2,173 @@
 import numpy as np
 import pandas as pd
 
+from typing import Tuple
+
 class LogAnalyzer:
 
     def __init__(self, data: pd.DataFrame, global_timeline: pd.DataFrame):
         self._data = data
         self._global_timeline = global_timeline
-    
-        self.overtake_metrics = None
-    
-    def build_overtake(self):
-        overtake_timeline = self.create_overtake_timeline(self._global_timeline)
-        self.overtake_metrics = self.OvertakeMetrics(overtake_timeline)
+        self._overtake_timeline = self.create_overtake_timeline()
+        self.num_threads = data['thread_id'].values[-1] + 1  # Assuming thread IDs are 0-indexed and contiguous
+        self.operation_count = len(data)
+        self.event_count = len(global_timeline)
 
-
-####################################################
-#
-#            BUILD TIMELINES
-#
-#####################################################
-
-    @staticmethod
-    def create_overtake_timeline(global_timeline: pd.DataFrame) -> np.ndarray:
+    def create_overtake_timeline(self) -> pd.DataFrame:
         """
-        Creates an operation-wise timeline of overtakes
-        operations are ordered based on invocation time
+        Creates an operation-wise timeline of overtakes.
+        Operations are ordered based on invocation time.
         """
+        timeline = self._global_timeline
+        
+        if timeline.empty:
+            return pd.DataFrame(columns=['invocation_time', 'thread_id', 'intervening_acquisitions'])
 
-        timeline = global_timeline
         # 1. Create the cumulative sum of all acquisitions
-        is_acq = (timeline['event_type'] == 'acquisition').astype(int)
-        acq_cumsum = np.cumsum(is_acq)
+        acq_cumsum = (timeline['event_type'] == 'acquisition').cumsum()
         
-        op_results = []
+        # 2. Isolate invocations and acquisitions, tagging them with an operation sequence number per thread
+        inv_mask = timeline['event_type'] == 'invocation'
+        acq_mask = timeline['event_type'] == 'acquisition'
         
-        # 2. Iterate through each thread to pair its internal events
-        for tid in np.unique(timeline['thread_id']):
-            # Identify the timeline indices for this thread's events
-            thread_mask = (timeline['thread_id'] == tid)
-            inv_indices = np.where(thread_mask & (timeline['event_type'] == 'invocation'))[0]
-            acq_indices = np.where(thread_mask & (timeline['event_type'] == 'acquisition'))[0]
-            
-            # Get the start times (to preserve global order later)
-            start_times = timeline['timestamp'][inv_indices]
-            
-            # Calculate intervening counts:
-            # (Total acquisitions at time of capture) - (Total acquisitions at time of request) - 1
-            counts_at_inv = acq_cumsum[inv_indices]
-            counts_at_acq = acq_cumsum[acq_indices]
-            intervening = counts_at_acq - counts_at_inv - 1
-            
-            # Store as (timestamp, thread_id, count)
-            for ts, count in zip(start_times, intervening):
-                op_results.append((ts, tid, count))
-
-        # 3. Convert to a structured array
-        dtype = [
-            ('invocation_time', 'u8'),
-            ('thread_id', 'u4'),
-            ('intervening_acquisitions', 'i4')
-        ]
-        final_ops = np.array(op_results, dtype=dtype)
+        inv_df = pd.DataFrame({
+            'thread_id': timeline.loc[inv_mask, 'thread_id'],
+            'invocation_time': timeline.loc[inv_mask, 'timestamp'],
+            'counts_at_inv': acq_cumsum[inv_mask],
+            'op_seq': timeline[inv_mask].groupby('thread_id').cumcount()
+        })
         
-        # 4. Sort by invocation_time so the array is "per operation" in order
-        # final_ops.sort(order='invocation_time')
+        acq_df = pd.DataFrame({
+            'thread_id': timeline.loc[acq_mask, 'thread_id'],
+            'counts_at_acq': acq_cumsum[acq_mask],
+            'op_seq': timeline[acq_mask].groupby('thread_id').cumcount()
+        })
+        
+        # 3. Merge the two sets so each invocation lines up with its corresponding acquisition
+        merged = pd.merge(inv_df, acq_df, on=['thread_id', 'op_seq'])
+        
+        # 4. Calculate intervening counts
+        merged['intervening_acquisitions'] = merged['counts_at_acq'] - merged['counts_at_inv'] - 1
+        
+        # 5. Filter to the required columns and sort by invocation time
+        final_ops = merged[['invocation_time', 'thread_id', 'intervening_acquisitions']]
+        final_ops = final_ops.sort_values(by='invocation_time', ignore_index=True)
         
         return final_ops
 
-
 #############################
 #
-#         METRICS
+#        AVG METRICS
 #
 #############################
-
 
     def calculate_all(self):
         pass
 
-    def find_avg_per_thread_wait_time(self) -> np.ndarray:
+    def find_avg_per_thread_wait_time(self) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Computes the average wait time for each thread and returns it as a NumPy array.
+        Computes the average and variance of wait time for each thread.
+        Returns: (averages_array, variances_array)
         """
-        avg_wait_times = np.zeros(self.num_threads)
-        
-        for thread in self._data:
-            avg_wait = np.mean(thread['wait_times'])
-            avg_wait_times[thread['thread_id']] = avg_wait
-        
-        return avg_wait_times
+        if self._data.empty:
+            return np.zeros(self.num_threads), np.zeros(self.num_threads)
 
-    def percent_time_in_CS(self) -> np.ndarray:
-        """
-        Computes the percentage of time each thread spends in the critical section.
-        """
-        percentages = np.zeros(self.num_threads)  # Pre-allocate for efficiency
+        # 1. Group and calculate both mean and variance simultaneously
+        stats = self._data.groupby('thread_id')['wait_times'].agg(['mean', 'var'])
         
-        for thread in self._data:
-            total_wait_time = np.sum(thread['wait_times'])
-            total_hold_time = np.sum(thread['hold_times'])
-            
-            if total_wait_time + total_hold_time > 0:
-                percent_in_cs = (total_hold_time / (total_wait_time + total_hold_time)) * 100
-            else:
-                percent_in_cs = 0.0
-            
-            percentages[thread['thread_id']] = percent_in_cs
+        # 2. Reindex to ensure all threads (0 to num_threads - 1) are present
+        aligned = stats.reindex(range(self.num_threads), fill_value=0.0)
         
-        return percentages
+        # 3. Pandas variance (ddof=1) returns NaN if a thread has only 1 data point. Fill with 0.0.
+        aligned['var'] = aligned['var'].fillna(0.0)
+        
+        return aligned['mean'].to_numpy(), aligned['var'].to_numpy()
+
+    def percent_time_in_CS(self) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Computes the average and variance of the percentage of time spent in the 
+        critical section per lock acquisition event, per thread.
+        Returns: (averages_array, variances_array)
+        """
+        if self._data.empty:
+            return np.zeros(self.num_threads), np.zeros(self.num_threads)
+
+        # 1. Calculate total time per individual event
+        total_time = self._data['wait_times'] + self._data['hold_times']
+        
+        # 2. Compute individual event percentages safely
+        event_pct = np.where(total_time > 0, (self._data['hold_times'] / total_time) * 100, 0.0)
+        
+        # 3. Create a temporary dataframe to group by thread_id
+        temp_df = pd.DataFrame({
+            'thread_id': self._data['thread_id'],
+            'pct_in_cs': event_pct
+        })
+        
+        # 4. Group and aggregate
+        stats = temp_df.groupby('thread_id')['pct_in_cs'].agg(['mean', 'var'])
+        aligned = stats.reindex(range(self.num_threads), fill_value=0.0)
+        aligned['var'] = aligned['var'].fillna(0.0)
+        
+        return aligned['mean'].to_numpy(), aligned['var'].to_numpy()
+
+    def overtake_percentage(self) -> Tuple[float, float]:
+        """
+        Computes the mean percentage and variance of operations that are overtaken.
+        Returns: (mean_percentage, variance_of_percentage)
+        """
+        counts = self._overtake_timeline['intervening_acquisitions']
+
+        if counts.empty:
+            return 0.0, 0.0
+
+        # Create a boolean/float series (1.0 for overtaken, 0.0 for not)
+        is_overtaken = (counts > 0).astype(float)
+
+        # Mean is the fraction of True values. Multiply by 100 for percentage.
+        mean_pct = float(is_overtaken.mean() * 100)
+        
+        # Variance of the 0/1 occurrences scaled to percentage
+        var_pct = float(is_overtaken.var() * (100 ** 2))
+        
+        if pd.isna(var_pct):
+            var_pct = 0.0
+
+        return mean_pct, var_pct
+    
+    def average_overtake_depth(self) -> Tuple[float, float]:
+        """
+        Computes the average and variance of the depth of elements with overtake depth > 0.
+        Returns: (mean_depth, variance_depth)
+        """
+        overtake_depths = self._overtake_timeline['intervening_acquisitions']
+        positive_depths = overtake_depths[overtake_depths > 0]
+
+        if positive_depths.empty:
+            return 0.0, 0.0
+
+        mean_depth = float(positive_depths.mean())
+        var_depth = float(positive_depths.var())
+        
+        if pd.isna(var_depth):
+            var_depth = 0.0
+
+        return mean_depth, var_depth
+    
+
+##############################
+#
+#       PER RUN METRICS
+#
+##############################
 
     def total_CS_completions(self) -> int:
         """
         Computes the total number of critical section completions
         """
-        completions = 0
-        
-        for thread in self._data:
-            num_completions = len(thread['hold_times'])
-            completions += num_completions
-        
-        return completions
+        return int(len(self._data))
 
-    def track_lock_ownership_transfer(self) -> np.ndarray:
+    def lock_transfer_matrix(self) -> np.ndarray:
         """
         Tracks which threads are most likely to aquire lock after some thread X releases lock
         Returns nxn np.array where n = thread count
@@ -148,50 +194,18 @@ class LogAnalyzer:
         return transfer_table
 
 
-###################################
-#
-#    OVERTAKE METRICS OBJECT
-#
-###################################
+    def rank_inversion_penalty(self, denom=100000) -> float:
+        """
+        Computes the total rank inversion penalty across all operations.
+        returns as per-denom, default 100k operations
+        k = 2, or quadratic penalty
+        one operation overtaken 3 times is worse than 3 operations overtaken once each
+        """
+        if self._overtake_timeline.empty:
+            return 0.0
 
-    class OvertakeMetrics:
-
-        def __init__(self, overtake_timeline: np.ndarray):
-            self._overtake_timeline = overtake_timeline
-
-        def overtake_percentage(self) -> float:
-            """
-            Computes the percentage of operations that are overtaken.
-            """
-            counts = self._overtake_timeline['intervening_acquisitions']
-        
-            if counts.size == 0:
-                return 0.0
-            
-            # np.mean on a boolean mask gives the fraction of True values
-            return np.mean(counts > 0) * 100
-
-        def average_overtake_depth(self) -> float:
-            """
-            average overtake depth is the average depth of elements with overtake depth > 0
-            """
-            overtake_depths = self._overtake_timeline['intervening_acquisitions']
-            positive_depths = overtake_depths[overtake_depths > 0]
-            
-            if len(positive_depths) == 0:
-                return 0.0
-            
-            return np.mean(positive_depths)
-        
-        def rank_inversion_penalty(self, denom=100000) -> float:
-            """
-            Computes the total rank inversion penalty across all operations.
-            returns as per-denom, default 100k operations
-            k = 2, or quadratic penalty
-            one operation overtaken 3 times is worse than 3 operations overtaken once each
-            """
-
-            total_rip = np.sum(self._overtake_timeline['intervening_acquisitions'] ** 2)
-            scaled_rip = total_rip / denom
-            return scaled_rip
+        # Vectorized squaring and sum using native pandas methods
+        total_rip = (self._overtake_timeline['intervening_acquisitions'] ** 2).sum()
+        scaled_rip = total_rip / denom
+        return float(scaled_rip)
     
