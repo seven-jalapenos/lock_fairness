@@ -36,7 +36,7 @@ class MetricAverager:
         #     'rank_inversion_penalty': Stats
         # }
 
-    def build_table(self) -> MetricAverager:
+    def build_table(self) -> 'MetricAverager':
         self.all_metrics, self.metric_vars, self.thread_count = self.all_metrics_and_thread_count(
             self.data_dir, self.timeline_dir
         )

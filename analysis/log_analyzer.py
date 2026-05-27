@@ -74,7 +74,7 @@ class LogAnalyzer:
             return np.zeros(self.num_threads), np.zeros(self.num_threads)
 
         # 1. Group and calculate both mean and variance simultaneously
-        stats = self._data.groupby('thread_id')['wait_times'].agg(['mean', 'var'])
+        stats = self._data.groupby('thread_id')['wait_time'].agg(['mean', 'var'])
         
         # 2. Reindex to ensure all threads (0 to num_threads - 1) are present
         aligned = stats.reindex(range(self.num_threads), fill_value=0.0)
