@@ -47,8 +47,8 @@
                 avg_metricsN
             /run_id2
             ...
-        /aggragate
-            `decide later what metrics are importaint` 
+        /aggregate
+            `decide later what metrics are important` 
     /figures
 
 

@@ -26,15 +26,15 @@ class MetricAverager:
         self.metric_vars = pd.DataFrame()
         self.thread_count: int = 0
 
-        self.avg_metrics: Dict[str, Any] = {
-            'per_thread_wait_time': [],
-            'percent_time_in_CS': Stats, 
-            'total_CS_completions': Stats,
-            'lock_transfer_matrix': [],
-            'overtake_percentage': Stats,
-            'average_overtake_depth': Stats,
-            'rank_inversion_penalty': Stats
-        }
+        # self.avg_metrics: Dict[str, Any] = {
+        #     'per_thread_wait_time': [],
+        #     'percent_time_in_CS': Stats, 
+        #     'total_CS_completions': Stats,
+        #     'lock_transfer_matrix': [],
+        #     'overtake_percentage': Stats,
+        #     'average_overtake_depth': Stats,
+        #     'rank_inversion_penalty': Stats
+        # }
 
     def build_table(self) -> MetricAverager:
         self.all_metrics, self.metric_vars, self.thread_count = self.all_metrics_and_thread_count(
@@ -67,6 +67,7 @@ class MetricAverager:
             avg_wait, var_wait = analyzer.find_avg_per_thread_wait_time()
             avg_overtake, var_overtake = analyzer.overtake_percentage()
             avg_depth, var_depth = analyzer.average_overtake_depth()
+            rmrip, var_rip = analyzer.root_mean_rank_inversion_penalty()
 
             # 2. Store run metrics in a dictionary (much safer for arrays than 1-row DataFrames)
             run_records.append({
@@ -79,7 +80,7 @@ class MetricAverager:
                 'average_overtake_depth': avg_depth,
                 'total_CS_completions': analyzer.total_CS_completions(),
                 'lock_transfer_matrix': analyzer.lock_transfer_matrix(),
-                'rank_inversion_penalty': analyzer.rank_inversion_penalty()
+                'rank_inversion_penalty': rmrip
             })
 
             # 3. Store variance metrics
@@ -88,6 +89,7 @@ class MetricAverager:
                 'per_thread_wait_time': var_wait,
                 'overtake_percentage': var_overtake,
                 'average_overtake_depth': var_depth,
+                'rank_inversion_penalty': var_rip
             })
         
         # Convert list of dicts to DataFrame in one shot
@@ -139,7 +141,7 @@ class MetricAverager:
         operation_counts = self.all_metrics['operation_count'].to_numpy()
 
         # 1. Single Value Mean Metrics
-        for metric in ['overtake_percentage', 'average_overtake_depth']:
+        for metric in ['overtake_percentage', 'average_overtake_depth', 'rank_inversion_penalty']:
             vals = self.all_metrics[metric].to_numpy()
             vars_ = self.metric_vars[metric].to_numpy()
             metrics_stats[metric] = self.single_mean_stats(operation_counts, vals, vars_)
@@ -162,7 +164,7 @@ class MetricAverager:
         metrics_stats[metric] = thread_stats
 
         # 3. Single Value Accumulated Metrics
-        for metric in ['total_CS_completions', 'rank_inversion_penalty']:
+        for metric in ['total_CS_completions']:
             if metric in self.all_metrics:
                 vals = self.all_metrics[metric].to_numpy()
                 metrics_stats[metric] = self.single_acc_stats(operation_counts, vals)

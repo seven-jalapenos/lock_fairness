@@ -194,18 +194,19 @@ class LogAnalyzer:
         return transfer_table
 
 
-    def rank_inversion_penalty(self, denom=100000) -> float:
+    def root_mean_rank_inversion_penalty(self) -> Tuple[float, float]:
         """
-        Computes the total rank inversion penalty across all operations.
-        returns as per-denom, default 100k operations
+        Computes the root mean rank inversion penalty across all operations.
         k = 2, or quadratic penalty
         one operation overtaken 3 times is worse than 3 operations overtaken once each
         """
         if self._overtake_timeline.empty:
-            return 0.0
+            return 0.0, 0.0
 
         # Vectorized squaring and sum using native pandas methods
-        total_rip = (self._overtake_timeline['intervening_acquisitions'] ** 2).sum()
-        scaled_rip = total_rip / denom
-        return float(scaled_rip)
+        total_rip = self._overtake_timeline['intervening_acquisitions'] ** 2
+        avg_rip = float(total_rip.mean())
+        var_rip = float(total_rip.var())
+        rmrip = np.sqrt(avg_rip)
+        return rmrip, var_rip
     
