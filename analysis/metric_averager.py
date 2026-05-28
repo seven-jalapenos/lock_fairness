@@ -124,13 +124,14 @@ class MetricAverager:
         val_total = np.sum(values)
         
         # Average per operation
-        avg = val_total / N_total
+        avg_rate = val_total / N_total
+        run_rates = values / N
 
-        squared_drift = (values - avg) ** 2
+        squared_drift = (run_rates - avg_rate) ** 2
         var_total = np.dot(N, squared_drift) / N_total
         std_total = np.sqrt(var_total)
 
-        return Stats(avg=avg, std=std_total)
+        return Stats(avg=avg_rate, std=std_total)
     
     def find_means_and_stds(self) -> Dict[str, Any]:
         """

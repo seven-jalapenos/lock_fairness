@@ -66,7 +66,7 @@ class CrossRunPlotter:
         Extracts 'lock_type' and 'threads'. Modify this if your naming differs.
         """
         # Looks for words before '_t' and digits after '_t'
-        match = re.search(r'(?P<lock>[A-Za-z]+)_1_(?P<threads>\d+)', folder_name)
+        match = re.search(r'(?P<lock>[A-Za-z]+)_(?P<threads>\d+)_1', folder_name)
         if match:
             return {
                 'lock_type': match.group('lock'),

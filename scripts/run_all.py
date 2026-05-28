@@ -25,3 +25,21 @@
 
 # if __name__ == "__main__":
 #     main()
+
+from pathlib import Path
+
+from all_metrics import average_all_metrics
+from plot_all import plot_single_runs, plot_cross_runs
+
+if __name__ == '__main__':
+    files_dir = Path("files/csv")
+    figures_dir = Path("files/final_figures")
+
+    # Step 1: Average all metrics across runs and export to CSV
+    average_all_metrics(files_dir)
+
+    # Step 2: Plot metrics for each individual run
+    plot_single_runs(files_dir)
+
+    # Step 3: Plot comparative metrics across all runs
+    plot_cross_runs(files_dir, figures_dir)

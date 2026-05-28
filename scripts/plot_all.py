@@ -6,7 +6,7 @@ from analysis.single_run_plotter import SingleRunPlotter
 from analysis.cross_run_plotter import CrossRunPlotter
 
 
-def plot_single_run(run_dir: Path) -> None:
+def plot_single_runs(run_dir: Path) -> None:
     """Utility function to plot all metrics from a single run."""
     run_dirs = list(run_dir.glob("*"))
     for dir in run_dirs:
@@ -14,7 +14,7 @@ def plot_single_run(run_dir: Path) -> None:
         plotter = SingleRunPlotter(dir, dir / "figures")
         plotter.plot_all()
 
-def plot_cross_run(runs_csv_dir: Path, figures_dir: Path) -> None:
+def plot_cross_runs(runs_csv_dir: Path, figures_dir: Path) -> None:
     """Utility function to plot comparative metrics across multiple runs."""
     metrics = [
         'overtake_percentage',
@@ -31,5 +31,5 @@ def plot_cross_run(runs_csv_dir: Path, figures_dir: Path) -> None:
 if __name__ == '__main__':
     runs_csv_dir = Path("files/csv")
     figures_dir = Path("files/final_figures")
-    plot_single_run(runs_csv_dir)
-    plot_cross_run(runs_csv_dir, figures_dir)
+    plot_single_runs(runs_csv_dir)
+    plot_cross_runs(runs_csv_dir, figures_dir)
