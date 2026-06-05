@@ -2,14 +2,15 @@
 import numpy as np
 import pandas as pd
 
-from typing import Tuple
+from pathlib import Path
+from typing import Tuple, Optional
 
 class LogAnalyzer:
 
-    def __init__(self, data: pd.DataFrame, global_timeline: pd.DataFrame):
+    def __init__(self, data: pd.DataFrame, global_timeline: pd.DataFrame, overtake_timeline: Optional[pd.DataFrame]=None):
         self._data = data
         self._global_timeline = global_timeline
-        self._overtake_timeline = self.create_overtake_timeline()
+        self._overtake_timeline = overtake_timeline if overtake_timeline is not None else self.create_overtake_timeline()
         self.num_threads = data['thread_id'].values[-1] + 1  # Assuming thread IDs are 0-indexed and contiguous
         self.operation_count = len(data)
         self.event_count = len(global_timeline)
@@ -17,44 +18,55 @@ class LogAnalyzer:
     def create_overtake_timeline(self) -> pd.DataFrame:
         """
         Creates an operation-wise timeline of overtakes.
-        Operations are ordered based on invocation time.
+        O(N*t) complexity using a chronological state-tracker.
         """
         timeline = self._global_timeline
         
         if timeline.empty:
             return pd.DataFrame(columns=['invocation_time', 'thread_id', 'intervening_acquisitions'])
 
-        # 1. Create the cumulative sum of all acquisitions
-        acq_cumsum = (timeline['event_type'] == 'acquisition').cumsum()
-        
-        # 2. Isolate invocations and acquisitions, tagging them with an operation sequence number per thread
-        inv_mask = timeline['event_type'] == 'invocation'
-        acq_mask = timeline['event_type'] == 'acquisition'
-        
-        inv_df = pd.DataFrame({
-            'thread_id': timeline.loc[inv_mask, 'thread_id'],
-            'invocation_time': timeline.loc[inv_mask, 'timestamp'],
-            'counts_at_inv': acq_cumsum[inv_mask],
-            'op_seq': timeline[inv_mask].groupby('thread_id').cumcount()
-        })
-        
-        acq_df = pd.DataFrame({
-            'thread_id': timeline.loc[acq_mask, 'thread_id'],
-            'counts_at_acq': acq_cumsum[acq_mask],
-            'op_seq': timeline[acq_mask].groupby('thread_id').cumcount()
-        })
-        
-        # 3. Merge the two sets so each invocation lines up with its corresponding acquisition
-        merged = pd.merge(inv_df, acq_df, on=['thread_id', 'op_seq'])
-        
-        # 4. Calculate intervening counts
-        merged['intervening_acquisitions'] = merged['counts_at_acq'] - merged['counts_at_inv'] - 1
-        
-        # 5. Filter to the required columns and sort by invocation time
-        final_ops = merged[['invocation_time', 'thread_id', 'intervening_acquisitions']]
-        final_ops = final_ops.sort_values(by='invocation_time', ignore_index=True)
+        # 1. Drop out of Pandas into a native NumPy array to eliminate loop overhead
+        # Assuming timeline is already chronologically sorted by timestamp
+        events = timeline[['timestamp', 'event_type', 'thread_id']].to_numpy()
+
+        # State trackers
+        pending_invocations = {}  # thread_id -> (invocation_time, result_index)
+        results = []              # Will store lists of: [invocation_time, thread_id, overtake_count]
+
+        # 2. Step through the chronological timeline O(N)
+        for timestamp, event_type, thread_id in events:
+            
+            if event_type == 'invocation':
+                # Save its future index in the results array so we can increment its penalty later
+                idx = len(results)
+                results.append([timestamp, thread_id, 0])
+                pending_invocations[thread_id] = (timestamp, idx)
+                
+            elif event_type == 'acquisition':
+                # The thread acquired the lock, remove it from the pending pool
+                if thread_id in pending_invocations:
+                    acq_inv_time, _ = pending_invocations.pop(thread_id)
+                    
+                    # 3. Check who it overtook O(t)
+                    # Iterate through the remaining pending threads (max size = t - 1)
+                    for other_thread, (other_inv_time, other_idx) in pending_invocations.items():
+                        
+                        # If the acquiring thread invoked AFTER the pending thread,
+                        # it means the pending thread was overtaken.
+                        if acq_inv_time > other_inv_time:
+                            results[other_idx][2] += 1
+                            
+        # 4. Rebuild the final dataframe in one shot
+        final_ops = pd.DataFrame(results, columns=['invocation_time', 'thread_id', 'intervening_acquisitions'])
         
         return final_ops
+    
+    def print_overtake(self, file_path: Path) -> None:
+        """
+        Utility function to print out the overtake timeline to parquet.
+        """
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        self._overtake_timeline.to_parquet(file_path)
 
 #############################
 #
@@ -65,16 +77,16 @@ class LogAnalyzer:
     def calculate_all(self):
         pass
 
-    def find_avg_per_thread_wait_time(self) -> Tuple[np.ndarray, np.ndarray]:
+    def find_avg_per_thread_wait_time(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Computes the average and variance of wait time for each thread.
-        Returns: (averages_array, variances_array)
+        Computes the average and variance of wait time for each thread as well as number of wait events of each thread.
+        Returns: (averages_array, variances_array, counts_array)
         """
         if self._data.empty:
-            return np.zeros(self.num_threads), np.zeros(self.num_threads)
+            return np.zeros(self.num_threads), np.zeros(self.num_threads), np.zeros(self.num_threads)
 
         # 1. Group and calculate both mean and variance simultaneously
-        stats = self._data.groupby('thread_id')['wait_time'].agg(['mean', 'var'])
+        stats = self._data.groupby('thread_id')['wait_time'].agg(['mean', 'var', 'count'])
         
         # 2. Reindex to ensure all threads (0 to num_threads - 1) are present
         aligned = stats.reindex(range(self.num_threads), fill_value=0.0)
@@ -82,7 +94,7 @@ class LogAnalyzer:
         # 3. Pandas variance (ddof=1) returns NaN if a thread has only 1 data point. Fill with 0.0.
         aligned['var'] = aligned['var'].fillna(0.0)
         
-        return aligned['mean'].to_numpy(), aligned['var'].to_numpy()
+        return aligned['mean'].to_numpy(), aligned['var'].to_numpy(), aligned['count'].to_numpy()
 
     def percent_time_in_CS(self) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -94,10 +106,10 @@ class LogAnalyzer:
             return np.zeros(self.num_threads), np.zeros(self.num_threads)
 
         # 1. Calculate total time per individual event
-        total_time = self._data['wait_times'] + self._data['hold_times']
+        total_time = self._data['wait_time'] + self._data['hold_time']
         
         # 2. Compute individual event percentages safely
-        event_pct = np.where(total_time > 0, (self._data['hold_times'] / total_time) * 100, 0.0)
+        event_pct = np.where(total_time > 0, (self._data['hold_time'] / total_time) * 100, 0.0)
         
         # 3. Create a temporary dataframe to group by thread_id
         temp_df = pd.DataFrame({
@@ -179,7 +191,7 @@ class LogAnalyzer:
         
         # 1. Filter only acquisition events
         acquisitions = self._global_timeline[self._global_timeline['event_type'] == 'acquisition']
-        t_ids = acquisitions['thread_id']
+        t_ids = acquisitions['thread_id'].to_numpy()
         
         # 2. 'from_threads' are elements 0 to N-1
         #    'to_threads'   are elements 1 to N
@@ -194,7 +206,7 @@ class LogAnalyzer:
         return transfer_table
 
 
-    def root_mean_rank_inversion_penalty(self) -> Tuple[float, float]:
+    def mean_squared_rank_inversion_penalty(self) -> Tuple[float, float]:
         """
         Computes the root mean rank inversion penalty across all operations.
         k = 2, or quadratic penalty
@@ -207,6 +219,5 @@ class LogAnalyzer:
         total_rip = self._overtake_timeline['intervening_acquisitions'] ** 2
         avg_rip = float(total_rip.mean())
         var_rip = float(total_rip.var())
-        rmrip = np.sqrt(avg_rip)
-        return rmrip, var_rip
+        return avg_rip, var_rip
     

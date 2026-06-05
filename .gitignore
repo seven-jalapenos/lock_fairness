@@ -16,3 +16,11 @@ files
 
 # python scripts will ensure these are created
 analysis/figures
+
+# sensitive data
+scripts/mail.py
+# unrelated to project
+scripts/rewrite_timelines.py
+
+# assembly analysis, files differ per system
+*.asm

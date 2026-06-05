@@ -20,16 +20,16 @@ def plot_cross_runs(runs_csv_dir: Path, figures_dir: Path) -> None:
         'overtake_percentage',
         'average_overtake_depth',
         'rank_inversion_penalty',
-        'total_CS_completions'
+        'total_CS_completions',
+        'average_wait_time'
         ]
     plotter = CrossRunPlotter(runs_csv_dir, figures_dir).load_data()
 
     for metric in metrics:
-        plotter.plot_metric(metric, x_axis='threads', line_axis='lock_type')
-    
+        plotter.plot_metric(metric, x_axis='threads', line_axis='lock_type', save_csv=True)
 
 if __name__ == '__main__':
     runs_csv_dir = Path("files/csv")
     figures_dir = Path("files/final_figures")
-    plot_single_runs(runs_csv_dir)
+    # plot_single_runs(runs_csv_dir)
     plot_cross_runs(runs_csv_dir, figures_dir)

@@ -68,13 +68,15 @@ class CrossRunPlotter:
         # Looks for words before '_t' and digits after '_t'
         match = re.search(r'(?P<lock>[A-Za-z]+)_(?P<threads>\d+)_1', folder_name)
         if match:
+            # if match.group('lock') == 'ttasb' or match.group('lock') == 'ttas':
+            #     return {}
             return {
                 'lock_type': match.group('lock'),
                 'threads': int(match.group('threads'))
             }
         return {}
 
-    def plot_metric(self, metric_name: str, x_axis: str, line_axis: Optional[str] = None) -> None:
+    def plot_metric(self, metric_name: str, x_axis: str, line_axis: Optional[str] = None, save_csv: bool = False) -> None:
         """
         Generates a plot tracking a specific metric across an x-axis (e.g., threads).
         Optionally separates data into different lines based on a line_axis (e.g., lock_type).
@@ -89,6 +91,26 @@ class CrossRunPlotter:
         if df_metric.empty:
             print(f"Metric '{metric_name}' not found in aggregated data.")
             return
+
+        if save_csv:
+            # Determine exactly which columns are relevant to this specific visualization
+            columns_to_save = [x_axis]
+            if line_axis and line_axis in df_metric.columns:
+                columns_to_save.append(line_axis)
+            columns_to_save.extend(['Average', 'Standard_Deviation'])
+            
+            # Filter to unique columns to avoid errors if any variables overlap
+            columns_to_save = list(dict.fromkeys([col for col in columns_to_save if col in df_metric.columns]))
+            
+            # Sort columns predictably matching how they are drawn on the chart
+            sort_order = [line_axis, x_axis] if (line_axis and line_axis in df_metric.columns) else [x_axis]
+            df_csv = df_metric[columns_to_save].sort_values(by=sort_order, ignore_index=True)
+            
+            # Save the CSV companion dataset
+            csv_filename = f"cross_run_{metric_name}_by_{x_axis}.csv"
+            csv_path = self.figures_dir / csv_filename
+            df_csv.to_csv(csv_path, index=False)
+            print(f"Saved cross-run metric data to: {csv_path}")
 
         plt.figure(figsize=(10, 6))
 

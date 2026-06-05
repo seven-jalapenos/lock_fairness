@@ -8,8 +8,8 @@ from analysis import LogParser, DataExporter
 from analysis import create_global_timeline
 
 param_space = {
-    'lock': ['mcs', 'clh', 'ticket', 'ttas', 'ttas_b'],
-    'threads': [1, 4, 8, 14, 28, 56],
+    'lock': ['mcs', 'clh', 'ticket', 'ttas', 'ttasb'],
+    'threads': [2, 4, 8, 14, 20, 26, 32, 38, 44, 50, 56],
     'pin': [1]
 }
 

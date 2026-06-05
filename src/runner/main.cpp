@@ -97,7 +97,7 @@ int main(int argc, char* argv[]) {
     int num_threads = 8;
     int pin = 1;
     std::string lock_type = "mcs";
-    int work = 1000;
+    int work = 10000;
     std::string filename;
     // parse arguments
     if (argc >= 4) {

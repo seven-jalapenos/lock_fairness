@@ -28,18 +28,48 @@
 
 from pathlib import Path
 
-from all_metrics import average_all_metrics
-from plot_all import plot_single_runs, plot_cross_runs
+from .all_metrics import average_all_metrics
+from .plot_all import plot_single_runs, plot_cross_runs
+from .runner import run_permutations
+from .mail import send_email
+import time
 
 if __name__ == '__main__':
     files_dir = Path("files/csv")
     figures_dir = Path("files/final_figures")
 
-    # Step 1: Average all metrics across runs and export to CSV
-    average_all_metrics(files_dir)
+    steps_completed = []
 
-    # Step 2: Plot metrics for each individual run
-    plot_single_runs(files_dir)
+    start = time.time()
 
-    # Step 3: Plot comparative metrics across all runs
-    plot_cross_runs(files_dir, figures_dir)
+    try:
+        run_permutations()
+        steps_completed.append("lock runs completed")
+
+        # Step 1: Average all metrics across runs and export to CSV
+        average_all_metrics(files_dir)
+        steps_completed.append("average metrics generated")
+
+        # Step 2: Plot metrics for each individual run
+        plot_single_runs(files_dir)
+        steps_completed.append("plot single run metrics")
+
+        # Step 3: Plot comparative metrics across all runs
+        plot_cross_runs(files_dir, figures_dir)
+        steps_completed.append("plot cross run metrics")
+
+        end = time.time()
+        duration = end - start
+        duration_minutes = duration / 60
+        duration_hours = duration_minutes / 60
+        send_email(
+            subject="Lock Fairness Analysis Completed",
+            body=f"The lock fairness analysis has completed successfully in {duration_hours:.2f} hours.",
+            to_email="jcjurgen@go.olemiss.edu"
+        )
+    except Exception as e:
+        send_email(
+            subject="Lock Fairness Analysis Failed",
+            body=f"Analysis failed with error: {str(e)}\nSteps completed before failure: {'\n'.join(steps_completed)}",
+            to_email="jcjurgen@go.olemiss.edu"
+        )

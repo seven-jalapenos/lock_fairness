@@ -68,3 +68,8 @@ finish metrics / metric averager
 metric csv writer
 aggragate metrics
 figure drawer
+
+## future progress?
+
+compare with timestamp based algorithms
+probabalistic algorithms?
