@@ -7,11 +7,18 @@ import gc
 from analysis import LogParser, DataExporter
 from analysis import create_global_timeline
 
+# rerun without mcs
 param_space = {
-    'lock': ['mcs', 'clh', 'ticket', 'ttas', 'ttasb'],
+    'lock': ['clh', 'ticket', 'ttas', 'ttasb'],
     'threads': [2, 4, 8, 14, 20, 26, 32, 38, 44, 50, 56],
     'pin': [1]
 }
+
+# param_space = {
+#     'lock': ['mcs', 'clh', 'ticket', 'ttas', 'ttasb'],
+#     'threads': [2, 4, 8, 14, 20, 26, 32, 38, 44, 50, 56],
+#     'pin': [1]
+# }
 
 # param_space = {
 #     'lock': ['ticket', 'ttas', 'ttas_b'],
@@ -60,26 +67,31 @@ class Runner:
         print("done")
         print("parsing logs...")
         log_parser = LogParser(out_file, offset_file_path, int(pin))
-        global_timeline = create_global_timeline(log_parser.all_threads_data)
+        global_timeline = create_global_timeline(log_parser.all_threads_data) # type: ignore
 
         print(f"writing raw data to {self.csv_dir} ...")
         pqt_writer = DataExporter(
-            log_parser.all_threads_data,
+            log_parser.all_threads_data, # type: ignore
             global_timeline,
             self.csv_dir,
             self.iteration_name
         )
         pqt_writer.write_raw()
 
-        del log_parser
-        del pqt_writer
-        gc.collect()
+        log_parser.close()
+        pqt_writer.close()
 
 def run_permutations():
     keys = param_space.keys()
     values = param_space.values()
 
     product_space = list(product(*values))
+    missing = [
+        ('mcs', 44, 1),
+        ('mcs', 50, 1),
+        ('mcs', 56, 1)
+    ]
+    product_space = missing + product_space
     # product_space.insert(0, ('clh', 56, 1)) # rerun 
 
     for params in product_space:

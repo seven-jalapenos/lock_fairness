@@ -15,6 +15,11 @@ class LogAnalyzer:
         self.operation_count = len(data)
         self.event_count = len(global_timeline)
 
+    def close(self) -> None:
+        self._data = None
+        self._global_timeline = None
+        self._overtake_timeline = None
+
     def create_overtake_timeline(self) -> pd.DataFrame:
         """
         Creates an operation-wise timeline of overtakes.

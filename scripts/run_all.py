@@ -52,11 +52,11 @@ if __name__ == '__main__':
 
         # Step 2: Plot metrics for each individual run
         plot_single_runs(files_dir)
-        steps_completed.append("plot single run metrics")
+        steps_completed.append("single run metrics plotted")
 
         # Step 3: Plot comparative metrics across all runs
         plot_cross_runs(files_dir, figures_dir)
-        steps_completed.append("plot cross run metrics")
+        steps_completed.append("cross run metrics plotted")
 
         end = time.time()
         duration = end - start

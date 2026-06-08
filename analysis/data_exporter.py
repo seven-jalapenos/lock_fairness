@@ -19,8 +19,10 @@ class DataExporter:
         """
         Writes the raw data and global timeline to parquet files.
         """
-        DataExporter.write_data(self.data, self.data_dir, self.run_name)
-        DataExporter.write_global_timeline(self.global_timeline, self.timeline_dir, self.run_name)
+        if self.data is not None and self.global_timeline is not None:
+            DataExporter.write_data(self.data, self.data_dir, self.run_name)
+            DataExporter.write_global_timeline(self.global_timeline, self.timeline_dir, self.run_name)
+        return
 
     def write_derived(self) -> None:
         """
@@ -35,3 +37,7 @@ class DataExporter:
     @staticmethod
     def write_global_timeline(global_timeline: pd.DataFrame, output_dir: str, run_name: str) -> None:
         global_timeline.to_parquet(os.path.join(output_dir, f'{run_name}_timeline.parquet'), engine='pyarrow')
+    
+    def close(self) -> None:
+        self.data = None
+        self.global_timeline = None

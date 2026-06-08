@@ -14,6 +14,10 @@ class LogParser:
 
         self.all_threads_data = self.parse_logs()
     
+    def close(self) -> None:
+        self.all_threads_data = None
+        self.offset_table = None
+    
     def parse_logs(self) -> pd.DataFrame:
         # Define the LogEntry structure (3 x uint64_t)
         log_entry_dtype = np.dtype([
@@ -48,7 +52,7 @@ class LogParser:
                     'thread_id': thread_id,
                     'data': data
                 }
-                tmp = self.calibrate_log(tmp, self.offset_table, self.pinning_policy)
+                tmp = self.calibrate_log(tmp, self.offset_table, self.pinning_policy) # type: ignore
 
                 # --- THE FLATTENING MAGIC HAPPENS HERE ---
                 # Passing the structured array directly to Pandas splits 

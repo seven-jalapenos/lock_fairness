@@ -1,14 +1,13 @@
 
 from .data_importer import import_parquet
 from .log_analyzer import LogAnalyzer
+from .defs import Stats
 
 from pathlib import Path
-from collections import namedtuple
-from statistics import mean, stdev
 import pandas as pd
 import numpy as np
-from typing import Dict, Any, Optional
-from .defs import Stats
+from typing import Dict, Any
+import gc
 
 data_dir = 'data'
 timeline_dir = 'timeline'
@@ -99,7 +98,9 @@ class MetricAverager:
                 'average_overtake_depth': var_depth,
                 'rank_inversion_penalty': var_rip
             })
-        
+
+            analyzer.close()
+
         # Convert list of dicts to DataFrame in one shot
         return pd.DataFrame(run_records), pd.DataFrame(var_records), threads
 
