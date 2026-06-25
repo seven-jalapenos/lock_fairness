@@ -1,4 +1,7 @@
 
+#include <emmintrin.h>
+#include <iterator>
+#include <memory>
 #include <string>
 #include <sys/types.h>
 #include <thread>
@@ -6,8 +9,10 @@
 #include <iostream>
 #include <barrier>
 
+#include <x86intrin.h> // _mm_lfence, __rdtsc, and __rdtscp 
+
 #include "logging.hpp"
-#include "rdtscp.hpp" // provides rdtscp() and find_offsets()
+#include "find_offsets.hpp" // for finding rdtscp offsets
 #include "pin_thread.hpp"
 
 #include "mcs_lock.hpp"
@@ -15,6 +20,9 @@
 #include "ticket_lock.hpp"
 #include "ttas_lock.hpp"
 #include "ttas_backoff_lock.hpp"
+#include "tsspin_lock.hpp"
+
+#define COMPILER_BARRIER() asm volatile("" ::: "memory")
 
 constexpr int CAPACITY = 1 << 26; // capacity of per-thread log buffer, ~67 million
 constexpr int DURATION = 10; // seconds
@@ -44,15 +52,23 @@ void worker(int thread_id, int core_id, Lock* lock, int iterations) {
     // phase 1: warmup
     while(!start.load(std::memory_order_relaxed)) {
         lock->lock();
-        asm volatile("" ::: "memory");
+        COMPILER_BARRIER();
         lock->unlock();
     }
     // phase 2: benchmark
     while(!stop.load(std::memory_order_relaxed)) {
-        uint64_t lock_invoke = rdtscp(aux);   // timestamp before lock invocation
+        _mm_lfence();
+        COMPILER_BARRIER();
+        uint64_t lock_invoke = __rdtsc();   // timestamp before lock invocation
+        COMPILER_BARRIER();
+
         lock->lock();
-        uint64_t lock_acquire = rdtscp(aux);  // timestamp immediately after lock acquisition
-        
+
+        COMPILER_BARRIER();
+        uint64_t lock_acquire = __rdtscp(&aux);  // timestamp immediately after lock acquisition
+        COMPILER_BARRIER();
+        _mm_lfence();
+
         // simulated work
         int x = 0;
         for (int i = 0; i < iterations; i++) {
@@ -60,7 +76,11 @@ void worker(int thread_id, int core_id, Lock* lock, int iterations) {
         }
         asm volatile("" :: "r"(x));
 
-        uint64_t lock_release = rdtscp(aux);  // timestamp immediately before lock release
+        COMPILER_BARRIER();
+        uint64_t lock_release = __rdtscp(&aux);  // timestamp immediately before lock release
+        COMPILER_BARRIER();
+        _mm_lfence();
+        
         lock->unlock();        
 
         log_event(lock_invoke, lock_acquire, lock_release);
@@ -152,7 +172,10 @@ int main(int argc, char* argv[]) {
         lock = std::make_unique<TTASLock>();
     } else if (lock_type == "ttas_b") {
         lock = std::make_unique<TTASLock_Backoff>();
-    } else {
+    } else if (lock_type == "tsspin"){
+        lock = std::make_unique<TSSpinLock>();
+    }
+    else {
         std::cerr << "Unknown lock type: " << lock_type << "\n";
         return 1;
     }

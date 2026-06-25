@@ -7,6 +7,7 @@
 #include <sched.h>
 #include <unistd.h>
 
+#include "find_offsets.hpp"
 #include "rdtscp.hpp" // For rdtscp implementation
 #include "pin_thread.hpp" // For pin_thread_to_core implementation
 
