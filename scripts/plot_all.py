@@ -31,5 +31,5 @@ def plot_cross_runs(runs_csv_dir: Path, figures_dir: Path) -> None:
 if __name__ == '__main__':
     runs_csv_dir = Path("files/csv")
     figures_dir = Path("files/final_figures")
-    # plot_single_runs(runs_csv_dir)
+    plot_single_runs(runs_csv_dir)
     plot_cross_runs(runs_csv_dir, figures_dir)

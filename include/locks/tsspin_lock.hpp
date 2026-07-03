@@ -7,8 +7,8 @@
 
 class TSSpinLock : public Lock {
 private:
-    std::atomic<bool> flag {false};
-    std::atomic<uint64_t> next {UINT64_MAX};
+    alignas(64) std::atomic<bool> flag {false};
+    alignas(64) std::atomic<uint64_t> next {UINT64_MAX};
 
 public:
     void lock() noexcept;

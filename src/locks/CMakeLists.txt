@@ -5,6 +5,7 @@ add_library(locks STATIC
     ticket_lock.cpp
     ttas_backoff_lock.cpp
     ttas_lock.cpp
+    tsspin_lock.cpp
 )
 
 # Tell CMake where the public headers are

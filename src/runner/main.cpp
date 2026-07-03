@@ -102,7 +102,7 @@ void worker(int thread_id, int core_id, Lock* lock, int iterations) {
 //                 clh
 //                 ticket
 //                 ttas
-//                 ttas_b (ttas with backoff)
+//                 ttasb (ttas with backoff)
 // 
 //      iteration number: number of iterations in critical section
 //
@@ -170,7 +170,7 @@ int main(int argc, char* argv[]) {
         lock = std::make_unique<TicketLock>();
     } else if (lock_type == "ttas") {
         lock = std::make_unique<TTASLock>();
-    } else if (lock_type == "ttas_b") {
+    } else if (lock_type == "ttasb") {
         lock = std::make_unique<TTASLock_Backoff>();
     } else if (lock_type == "tsspin"){
         lock = std::make_unique<TSSpinLock>();
