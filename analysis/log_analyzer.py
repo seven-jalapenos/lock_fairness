@@ -5,6 +5,8 @@ import pandas as pd
 from pathlib import Path
 from typing import Tuple, Optional
 
+from .defs import INVOCATION, ACQUISITION
+
 class LogAnalyzer:
 
     def __init__(self, data: pd.DataFrame, global_timeline: pd.DataFrame, overtake_timeline: Optional[pd.DataFrame]=None):
@@ -30,24 +32,29 @@ class LogAnalyzer:
         if timeline.empty:
             return pd.DataFrame(columns=['invocation_time', 'thread_id', 'intervening_acquisitions'])
 
-        # 1. Drop out of Pandas into a native NumPy array to eliminate loop overhead
-        # Assuming timeline is already chronologically sorted by timestamp
-        events = timeline[['timestamp', 'event_type', 'thread_id']].to_numpy()
+        # 1. Drop out of Pandas into native NumPy arrays to eliminate loop overhead.
+        # Extract each column separately so every array keeps its own dtype: a
+        # single to_numpy() over mixed uint64/int8/int64 columns would coerce the
+        # whole thing to float64 (losing TSC precision) or object (huge). Assumes
+        # the timeline is already chronologically sorted by timestamp.
+        ts = timeline['timestamp'].to_numpy()
+        ev = timeline['event_type'].to_numpy()
+        tid = timeline['thread_id'].to_numpy()
 
         # State trackers
         pending_invocations = {}  # thread_id -> (invocation_time, result_index)
         results = []              # Will store lists of: [invocation_time, thread_id, overtake_count]
 
         # 2. Step through the chronological timeline O(N)
-        for timestamp, event_type, thread_id in events:
-            
-            if event_type == 'invocation':
+        for timestamp, event_type, thread_id in zip(ts, ev, tid):
+
+            if event_type == INVOCATION:
                 # Save its future index in the results array so we can increment its penalty later
                 idx = len(results)
                 results.append([timestamp, thread_id, 0])
                 pending_invocations[thread_id] = (timestamp, idx)
-                
-            elif event_type == 'acquisition':
+
+            elif event_type == ACQUISITION:
                 # The thread acquired the lock, remove it from the pending pool
                 if thread_id in pending_invocations:
                     acq_inv_time, _ = pending_invocations.pop(thread_id)
@@ -195,7 +202,7 @@ class LogAnalyzer:
         transfer_table = np.zeros((n, n))
         
         # 1. Filter only acquisition events
-        acquisitions = self._global_timeline[self._global_timeline['event_type'] == 'acquisition']
+        acquisitions = self._global_timeline[self._global_timeline['event_type'] == ACQUISITION]
         t_ids = acquisitions['thread_id'].to_numpy()
         
         # 2. 'from_threads' are elements 0 to N-1

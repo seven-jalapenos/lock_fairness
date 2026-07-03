@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import os
 from .parse_offsets import parse_tsc_offsets
+from .defs import EVENT_CODES
 
 class LogParser:
     def __init__(self, file_path: str, offset_file_path: str, pinning_policy: int = 1):
@@ -130,8 +131,13 @@ def create_global_timeline(df: pd.DataFrame) -> pd.DataFrame:
         var_name='event_type',                                # New column holding the old column names
         value_name='timestamp'                                # New column holding the actual timestamps
     )
-    
-    # 2. Sort the entire dataframe chronologically by timestamp
+
+    # 2. Encode event_type as a compact int8 code instead of the melted strings.
+    # This keeps the timeline purely numeric so downstream consumers never
+    # materialize an object-dtype array (see analysis/defs.py).
+    timeline_df['event_type'] = timeline_df['event_type'].map(EVENT_CODES).astype(np.int8)
+
+    # 3. Sort the entire dataframe chronologically by timestamp
     timeline_df = timeline_df.sort_values(by='timestamp', ignore_index=True)
-    
+
     return timeline_df

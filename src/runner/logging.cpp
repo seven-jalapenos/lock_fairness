@@ -3,6 +3,8 @@
 #include "logging.hpp"
 #include <vector>
 #include <fstream>
+#include <cstdio>
+#include <cstdlib>
 
 struct alignas(64) ThreadLog {
     LogEntry* data;
@@ -28,7 +30,17 @@ void logging_init(int num_threads, size_t capacity_per_thread) {
 
 void init_thread_log() {
     idx = 0;
-    buffer = (LogEntry*) aligned_alloc(64, sizeof(LogEntry) * per_thread_capacity);
+    const size_t bytes = sizeof(LogEntry) * per_thread_capacity;
+    buffer = (LogEntry*) aligned_alloc(64, bytes);
+    // Fail loudly instead of segfaulting later in log_event: under memory
+    // pressure aligned_alloc can return nullptr, and log_event only guards the
+    // index bound, not a null buffer.
+    if (buffer == nullptr) {
+        std::fprintf(stderr,
+                     "init_thread_log: failed to allocate %zu-byte log buffer\n",
+                     bytes);
+        std::abort();
+    }
 }
 
 void finalize_thread_log(int thread_id) {
@@ -43,5 +55,10 @@ void dump_logs(const std::string& file) {
         out.write((char*)&all_logs[t].size, sizeof(size_t));
         out.write((char*)all_logs[t].data,
                   all_logs[t].size * sizeof(LogEntry));
+        // Release the per-thread buffer now that it is on disk. Harmless for the
+        // process's own exit, but keeps peak RSS honest if dump_logs is ever
+        // called before the process tears down.
+        free(all_logs[t].data);
+        all_logs[t].data = nullptr;
     }
 }

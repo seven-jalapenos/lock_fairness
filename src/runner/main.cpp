@@ -24,7 +24,13 @@
 
 #define COMPILER_BARRIER() asm volatile("" ::: "memory")
 
-constexpr int CAPACITY = 1 << 26; // capacity of per-thread log buffer, ~67 million
+// Capacity of per-thread log buffer. At 24 bytes/entry this is ~200 MiB/thread
+// (~11 GiB reserved at 56 threads). The old 1<<26 was ~1.5 GiB/thread (~84 GiB
+// at 56 threads), which let high-throughput locks (clh, ttasb) fill enough of
+// their buffers to trigger the OOM killer. A thread that exceeds this cap simply
+// stops logging (see log_event) rather than growing memory; bump it back up only
+// if a run needs to capture more than ~8.4M acquisitions from a single thread.
+constexpr int CAPACITY = 1 << 23; // ~8.4 million entries per thread
 constexpr int DURATION = 10; // seconds
 constexpr int WARMUP = 3; // seconds
 std::string LOG_DIR = "../files/logs/";
