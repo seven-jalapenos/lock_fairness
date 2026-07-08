@@ -33,8 +33,19 @@ from .plot_all import plot_single_runs, plot_cross_runs
 from .runner import run_permutations
 from .mail import send_email
 import time
+import faulthandler
+import signal
 
 if __name__ == '__main__':
+    # Dump a full Python traceback (all threads) on demand or on a hard crash.
+    # If the sweep ever hangs again, from another shell on the box run:
+    #     kill -USR1 $(pgrep -f scripts.run_all)
+    # and the current stack — the exact line it's stuck on — prints to stderr,
+    # without killing the process.
+    faulthandler.enable()
+    if hasattr(faulthandler, "register"):
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
+
     files_dir = Path("files/csv")
     figures_dir = Path("files/final_figures")
 
@@ -62,14 +73,20 @@ if __name__ == '__main__':
         duration = end - start
         duration_minutes = duration / 60
         duration_hours = duration_minutes / 60
+        print(f"analysis completed in {duration_hours:.2f} hours", flush=True)
         send_email(
             subject="Lock Fairness Analysis Completed",
             body=f"The lock fairness analysis has completed successfully in {duration_hours:.2f} hours.",
             to_email="jcjurgen@go.olemiss.edu"
         )
     except Exception as e:
+        # Surface the failure and how far we got instead of swallowing it (the
+        # send_email notifier is disabled). Re-raise so the process exits non-zero.
+        print(f"analysis FAILED: {e!r}", flush=True)
+        print("steps completed before failure: " + ", ".join(steps_completed), flush=True)
         send_email(
             subject="Lock Fairness Analysis Failed",
             body=f"Analysis failed with error: {str(e)}\nSteps completed before failure: {'\n'.join(steps_completed)}",
             to_email="jcjurgen@go.olemiss.edu"
         )
+        raise

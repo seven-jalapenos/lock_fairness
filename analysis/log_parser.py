@@ -35,6 +35,8 @@ class LogParser:
         
         thread_dfs = [] # We will store a flat DataFrame for each thread here
 
+        file_size = os.path.getsize(self.file_path)
+
         with open(self.file_path, 'rb') as f:
             thread_id = 0
             while True:
@@ -42,9 +44,22 @@ class LogParser:
                 size_data = np.fromfile(f, dtype=size_t_dtype, count=1)
                 if size_data.size == 0:
                     break
-                
-                num_entries = size_data[0]
-                
+
+                num_entries = int(size_data[0])
+
+                # Guard against a corrupt/truncated log: np.fromfile preallocates
+                # `count` elements up front, so a garbage num_entries (e.g. from a
+                # short write) would try to allocate terabytes and hang/thrash the
+                # box instead of failing. A thread can't have more entries than fit
+                # in the remaining bytes.
+                max_entries = (file_size - f.tell()) // log_entry_dtype.itemsize
+                if num_entries > max_entries:
+                    raise ValueError(
+                        f"Corrupt log {self.file_path}: thread {thread_id} claims "
+                        f"{num_entries} entries but only {max_entries} fit in the "
+                        f"remaining file. Log is likely truncated or malformed."
+                    )
+
                 # 2. Read all LogEntries for this thread in one block
                 data = np.fromfile(f, dtype=log_entry_dtype, count=num_entries)
                 

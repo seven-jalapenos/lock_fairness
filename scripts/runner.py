@@ -1,6 +1,7 @@
 
 import os
 import subprocess
+import time
 from itertools import product
 import gc
 
@@ -64,12 +65,25 @@ class Runner:
             check=True
         )
 
-        print("done")
-        print("parsing logs...")
-        log_parser = LogParser(out_file, offset_file_path, int(pin))
-        global_timeline = create_global_timeline(log_parser.all_threads_data) # type: ignore
+        log_mb = os.path.getsize(out_file) / 1e6
+        print(f"done (log {log_mb:.1f} MB)", flush=True)
 
-        print(f"writing raw data to {self.csv_dir} ...")
+        # Time the two parse stages separately and flush, so a hang here is
+        # attributable to a concrete stage (read vs melt/sort) instead of the
+        # vague "parsing logs..." — and so progress isn't lost to block buffering
+        # when stdout is a tmux logfile rather than a TTY.
+        print("parsing logs (read + calibrate)...", flush=True)
+        t0 = time.perf_counter()
+        log_parser = LogParser(out_file, offset_file_path, int(pin))
+        n_events = len(log_parser.all_threads_data)
+        print(f"  read {n_events} events in {time.perf_counter() - t0:.1f}s", flush=True)
+
+        print("building global timeline (melt + sort)...", flush=True)
+        t1 = time.perf_counter()
+        global_timeline = create_global_timeline(log_parser.all_threads_data) # type: ignore
+        print(f"  timeline of {len(global_timeline)} rows in {time.perf_counter() - t1:.1f}s", flush=True)
+
+        print(f"writing raw data to {self.csv_dir} ...", flush=True)
         pqt_writer = DataExporter(
             log_parser.all_threads_data, # type: ignore
             global_timeline,
@@ -108,6 +122,11 @@ def run_permutations():
         for i in range(10):
             runner = Runner(params_dict, output_dir, csv_output_dir, str(i))
             runner()
+            # The parse builds several large DataFrames per run; drop them and
+            # force a collection so RSS doesn't ratchet up across the sweep and
+            # trip the OOM killer on a later, larger run.
+            del runner
+            gc.collect()
 
 
 if __name__ == "__main__":
