@@ -3,34 +3,30 @@ import os
 import subprocess
 import time
 from itertools import product
+import psutil
 import gc
 
 from analysis import LogParser, DataExporter
 from analysis import create_global_timeline
 
-# rerun without mcs
 param_space = {
-    'lock': ['clh', 'ticket', 'ttas', 'ttasb'],
-    'threads': [2, 4, 8, 14, 20, 26, 32, 38, 44, 50, 56],
-    'pin': [1]
+     'lock': ['mcs', 'clh', 'ticket', 'ttas', 'ttasb', 'tsspin'],
+     'threads': list(range(1, 29)),
+     'pin': [1]
 }
 
-# param_space = {
-#     'lock': ['mcs', 'clh', 'ticket', 'ttas', 'ttasb'],
-#     'threads': [2, 4, 8, 14, 20, 26, 32, 38, 44, 50, 56],
-#     'pin': [1]
-# }
 
-# param_space = {
-#     'lock': ['ticket', 'ttas', 'ttas_b'],
-#     'threads': [1, 4, 8, 14, 28, 56],
-#     'pin': [1]
-# }
-
-log_dir = 'files/logs'
-csv_dir = 'files/csv'
+# log_dir = 'files/logs'
+# csv_dir = 'files/csv'
 
 offset_file_path = 'files/rdtsc_offsets.txt'
+
+process = psutil.Process(os.getpid())
+
+def report_memory():
+    rss = process.memory_info().rss / (1024 ** 3)
+    print(f"RSS: {rss:.2f} GiB", flush=True)
+
 
 class Runner:
     # TODO 
@@ -91,22 +87,38 @@ class Runner:
             self.iteration_name
         )
         pqt_writer.write_raw()
+        print("done writing")
 
         log_parser.close()
         pqt_writer.close()
 
-def run_permutations():
+def _run_complete(csv_output_dir: str, run_name: str) -> bool:
+    """Return True if this iteration's parquet outputs already exist AND are
+    readable, so a resumed sweep can skip it. Both the flat data and the timeline
+    parquet must be present and have a valid footer — a file truncated by a
+    mid-write crash fails the footer read and is treated as incomplete (redone),
+    so we never resume on top of a half-written, silently-bad file."""
+    import pyarrow.parquet as pq
+
+    paths = [
+        os.path.join(csv_output_dir, 'data', f'{run_name}_data.parquet'),
+        os.path.join(csv_output_dir, 'timeline', f'{run_name}_timeline.parquet'),
+    ]
+    for p in paths:
+        if not os.path.exists(p) or os.path.getsize(p) == 0:
+            return False
+        try:
+            pq.read_metadata(p)  # reads only the footer; raises if truncated/corrupt
+        except Exception:
+            return False
+    return True
+
+
+def run_permutations(csv_dir: str, log_dir: str='files/logs', param_space: dict=param_space_local):
     keys = param_space.keys()
     values = param_space.values()
 
     product_space = list(product(*values))
-    missing = [
-        ('mcs', 44, 1),
-        ('mcs', 50, 1),
-        ('mcs', 56, 1)
-    ]
-    product_space = missing + product_space
-    # product_space.insert(0, ('clh', 56, 1)) # rerun 
 
     for params in product_space:
         params_dict = dict(zip(keys, params))
@@ -120,6 +132,13 @@ def run_permutations():
         print(f"starting runs with with params: {params_dict}")
         # avg across 10 runs
         for i in range(10):
+            # Resume/checkpoint: skip iterations whose parquet outputs already
+            # exist and are valid, so a sweep killed partway (e.g. by the machine
+            # crashing) can be re-launched and pick up where it left off instead
+            # of recomputing everything.
+            if _run_complete(csv_output_dir, str(i)):
+                print(f"  skipping iteration {i} (already complete)", flush=True)
+                continue
             runner = Runner(params_dict, output_dir, csv_output_dir, str(i))
             runner()
             # The parse builds several large DataFrames per run; drop them and
@@ -129,5 +148,5 @@ def run_permutations():
             gc.collect()
 
 
-if __name__ == "__main__":
-    run_permutations()
+# if __name__ == "__main__":
+#     run_permutations()

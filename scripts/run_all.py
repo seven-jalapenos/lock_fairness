@@ -35,6 +35,7 @@ from .mail import send_email
 import time
 import faulthandler
 import signal
+import faulthandler
 
 if __name__ == '__main__':
     # Dump a full Python traceback (all threads) on demand or on a hard crash.
@@ -46,15 +47,23 @@ if __name__ == '__main__':
     if hasattr(faulthandler, "register"):
         faulthandler.register(signal.SIGUSR1, all_threads=True)
 
-    files_dir = Path("files/csv")
-    figures_dir = Path("files/final_figures")
+    faulthandler.enable()
+    files_dir = Path("files/pqt")
+    figures_dir = Path("files/final_figures_2")
 
     steps_completed = []
 
     start = time.time()
 
+    # param_space_local= {
+    #     'lock': ['tsspin'],
+    #     'threads': list(range(1, 29)),
+    #     'pin': [1]
+    # }
+    # param_space_local = [('ttasb', x, 1 for x in range(10, 29)] + param_space_local
+
     try:
-        run_permutations()
+        run_permutations(csv_dir=str(files_dir))
         steps_completed.append("lock runs completed")
 
         # Step 1: Average all metrics across runs and export to CSV

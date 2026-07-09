@@ -27,6 +27,7 @@ class LogAnalyzer:
         Creates an operation-wise timeline of overtakes.
         O(N*t) complexity using a chronological state-tracker.
         """
+        assert(self._global_timeline is not None)
         timeline = self._global_timeline
         
         if timeline.empty:
@@ -77,6 +78,7 @@ class LogAnalyzer:
         """
         Utility function to print out the overtake timeline to parquet.
         """
+        assert(self._overtake_timeline is not None)
         file_path.parent.mkdir(parents=True, exist_ok=True)
         self._overtake_timeline.to_parquet(file_path)
 
@@ -94,6 +96,7 @@ class LogAnalyzer:
         Computes the average and variance of wait time for each thread as well as number of wait events of each thread.
         Returns: (averages_array, variances_array, counts_array)
         """
+        assert(self._data is not None)
         if self._data.empty:
             return np.zeros(self.num_threads), np.zeros(self.num_threads), np.zeros(self.num_threads)
 
@@ -114,6 +117,7 @@ class LogAnalyzer:
         critical section per lock acquisition event, per thread.
         Returns: (averages_array, variances_array)
         """
+        assert(self._data is not None)
         if self._data.empty:
             return np.zeros(self.num_threads), np.zeros(self.num_threads)
 
