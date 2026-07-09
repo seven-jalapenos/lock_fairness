@@ -114,7 +114,7 @@ def _run_complete(csv_output_dir: str, run_name: str) -> bool:
     return True
 
 
-def run_permutations(csv_dir: str, log_dir: str='files/logs', param_space: dict=param_space_local):
+def run_permutations(csv_dir: str, log_dir: str='files/logs'):
     keys = param_space.keys()
     values = param_space.values()
 
