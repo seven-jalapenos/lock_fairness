@@ -21,6 +21,7 @@
 #include "ttas_lock.hpp"
 #include "ttas_backoff_lock.hpp"
 #include "tsspin_lock.hpp"
+#include "hash_lock.hpp"
 
 #define COMPILER_BARRIER() asm volatile("" ::: "memory")
 
@@ -180,6 +181,8 @@ int main(int argc, char* argv[]) {
         lock = std::make_unique<TTASLock_Backoff>();
     } else if (lock_type == "tsspin"){
         lock = std::make_unique<TSSpinLock>();
+    } else if (lock_type == "hash") {
+        lock = std::make_unique<HashLock>();
     }
     else {
         std::cerr << "Unknown lock type: " << lock_type << "\n";
