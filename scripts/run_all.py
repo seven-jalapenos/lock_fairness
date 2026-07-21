@@ -48,8 +48,8 @@ if __name__ == '__main__':
         faulthandler.register(signal.SIGUSR1, all_threads=True)
 
     faulthandler.enable()
-    files_dir = Path("files/pqt")
-    figures_dir = Path("files/final_figures_2")
+    files_dir = Path("files/pqt_release")
+    figures_dir = Path("files/final_figures_2_release")
 
     steps_completed = []
 

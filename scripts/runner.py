@@ -1,5 +1,6 @@
 
 import os
+import re
 import subprocess
 import time
 from itertools import product
@@ -14,6 +15,38 @@ param_space = {
      'threads': list(range(1, 29)),
      'pin': [1]
 }
+
+CMAKE_CACHE_PATH = 'build/CMakeCache.txt'
+
+
+def _assert_release_build(cmake_cache_path: str = CMAKE_CACHE_PATH) -> None:
+    """Refuse to run the sweep against a non-Release build.
+
+    A Debug build (no -O3/-march=native) is easy to leave in place after a
+    debugging session (cmake caches CMAKE_BUILD_TYPE until it's explicitly
+    reconfigured) and silently produces a lock_exe that's an order of
+    magnitude slower per iteration -- collapsing real contention and making
+    every fairness metric from the sweep meaningless, with no error to signal
+    it happened."""
+    if not os.path.exists(cmake_cache_path):
+        raise RuntimeError(
+            f"{cmake_cache_path} not found -- configure the build first: "
+            "cmake -B build -S . -DCMAKE_BUILD_TYPE=Release"
+        )
+
+    with open(cmake_cache_path) as f:
+        cache = f.read()
+
+    match = re.search(r'^CMAKE_BUILD_TYPE:STRING=(.*)$', cache, re.MULTILINE)
+    build_type = match.group(1).strip() if match else ''
+
+    if build_type != 'Release':
+        raise RuntimeError(
+            f"build/ is configured as CMAKE_BUILD_TYPE={build_type or '(empty)'}, not Release. "
+            "Benchmark numbers from a non-Release build are not comparable (no -O3/-march=native) "
+            "and will understate throughput/contention. Reconfigure and rebuild with: "
+            "cmake -B build -S . -DCMAKE_BUILD_TYPE=Release && cmake --build build -j"
+        )
 
 
 # log_dir = 'files/logs'
@@ -71,6 +104,7 @@ class Runner:
         print("parsing logs (read + calibrate)...", flush=True)
         t0 = time.perf_counter()
         log_parser = LogParser(out_file, offset_file_path, int(pin))
+        assert(log_parser.all_threads_data is not None)
         n_events = len(log_parser.all_threads_data)
         print(f"  read {n_events} events in {time.perf_counter() - t0:.1f}s", flush=True)
 
@@ -115,6 +149,8 @@ def _run_complete(csv_output_dir: str, run_name: str) -> bool:
 
 
 def run_permutations(csv_dir: str, log_dir: str='files/logs'):
+    _assert_release_build()
+
     keys = param_space.keys()
     values = param_space.values()
 
