@@ -60,26 +60,42 @@ class CrossRunPlotter:
             
         return self
 
+    # Run directories are named <lock>_<threads>_<pin>_w<work> (see
+    # scripts/runner.py:run_dir_id). Anchored, because an unanchored match would
+    # accept the `<lock>_<threads>_<pin>` prefix of a work-suffixed directory and
+    # silently collapse every work size onto one line. The work group is optional
+    # so directories from sweeps predating the work dimension still parse.
+    _DIR_PATTERN = re.compile(
+        r'^(?P<lock>[A-Za-z]+)_(?P<threads>\d+)_(?P<pin>\d+)(?:_w(?P<work>\d+))?$'
+    )
+
     def _default_param_parser(self, folder_name: str) -> Dict[str, Any]:
         """
-        Default parser assuming folder names like: `run_mcs_t4` or `run_ticket_t8`.
-        Extracts 'lock_type' and 'threads'. Modify this if your naming differs.
+        Parses run folder names like `mcs_8_1_w10000` (or legacy `mcs_8_1`) into
+        'lock_type', 'threads', 'pin' and 'work'. Modify this if your naming differs.
         """
-        # Looks for words before '_t' and digits after '_t'
-        match = re.search(r'(?P<lock>[A-Za-z]+)_(?P<threads>\d+)_1', folder_name)
+        match = self._DIR_PATTERN.match(folder_name)
         if match:
-            # if match.group('lock') == 'ttasb' or match.group('lock') == 'ttas':
-            #     return {}
+            work = match.group('work')
             return {
                 'lock_type': match.group('lock'),
-                'threads': int(match.group('threads'))
+                'threads': int(match.group('threads')),
+                'pin': int(match.group('pin')),
+                'work': int(work) if work is not None else None
             }
         return {}
 
-    def plot_metric(self, metric_name: str, x_axis: str, line_axis: Optional[str] = None, save_csv: bool = False) -> None:
+    def plot_metric(self, metric_name: str, x_axis: str, line_axis: Optional[str] = None,
+                    save_csv: bool = False, where: Optional[Dict[str, Any]] = None,
+                    name_suffix: str = '') -> None:
         """
         Generates a plot tracking a specific metric across an x-axis (e.g., threads).
         Optionally separates data into different lines based on a line_axis (e.g., lock_type).
+
+        `where` restricts the rows to an exact-match on parameter columns (e.g.
+        {'work': 10000}) and `name_suffix` distinguishes the resulting files --
+        together they let one aggregated tree emit a separate figure per work size
+        rather than drawing different CS lengths as points on the same line.
         """
         if self.aggregated_data.empty:
             print("No data to plot. Call load_data() first.")
@@ -87,7 +103,15 @@ class CrossRunPlotter:
 
         # Filter down to the specific metric we want to plot
         df_metric = self.aggregated_data[self.aggregated_data['Metric'] == metric_name]
-        
+
+        if where:
+            for key, value in where.items():
+                if key not in df_metric.columns:
+                    continue
+                # isna() rather than == for the legacy no-work group, since NaN != NaN
+                mask = df_metric[key].isna() if value is None else df_metric[key] == value
+                df_metric = df_metric[mask]
+
         if df_metric.empty:
             print(f"Metric '{metric_name}' not found in aggregated data.")
             return
@@ -107,7 +131,7 @@ class CrossRunPlotter:
             df_csv = df_metric[columns_to_save].sort_values(by=sort_order, ignore_index=True)
             
             # Save the CSV companion dataset
-            csv_filename = f"cross_run_{metric_name}_by_{x_axis}.csv"
+            csv_filename = f"cross_run_{metric_name}_by_{x_axis}{name_suffix}.csv"
             csv_path = self.figures_dir / csv_filename
             df_csv.to_csv(csv_path, index=False)
             print(f"Saved cross-run metric data to: {csv_path}")
@@ -145,7 +169,10 @@ class CrossRunPlotter:
             )
 
         # Formatting
-        plt.title(f"{metric_name.replace('_', ' ').title()} vs {x_axis.title()}", fontsize=14)
+        title = f"{metric_name.replace('_', ' ').title()} vs {x_axis.title()}"
+        if where:
+            title += " (" + ", ".join(f"{k}={v}" for k, v in where.items()) + ")"
+        plt.title(title, fontsize=14)
         plt.xlabel(x_axis.replace('_', ' ').title(), fontsize=12)
         plt.ylabel(f"{metric_name.replace('_', ' ').title()} (Average)", fontsize=12)
         
@@ -160,7 +187,7 @@ class CrossRunPlotter:
         plt.tight_layout()
 
         # Save figure
-        out_filename = f"cross_run_{metric_name}_by_{x_axis}.png"
+        out_filename = f"cross_run_{metric_name}_by_{x_axis}{name_suffix}.png"
         out_path = self.figures_dir / out_filename
         plt.savefig(out_path, dpi=300)
         plt.close()

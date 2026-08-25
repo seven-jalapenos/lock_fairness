@@ -4,17 +4,37 @@ import re
 import subprocess
 import time
 from itertools import product
-import psutil
 import gc
+
+try:
+    import psutil
+except ImportError:
+    # Only feeds the report_memory() debugging helper, and isn't in
+    # requirements.txt -- not worth making the whole pipeline unimportable.
+    psutil = None
 
 from analysis import LogParser, DataExporter
 from analysis import create_global_timeline
 
+# Valid lock names, mirroring the dispatch in src/runner/main.cpp. Kept here so
+# the CLI can reject a typo before burning a sweep on it.
+LOCK_TYPES = ['mcs', 'clh', 'ticket', 'ttas', 'ttasb', 'tsspin', 'hash']
+
 param_space = {
      'lock': ['mcs', 'clh', 'ticket', 'ttas', 'ttasb', 'tsspin'],
      'threads': list(range(1, 29)),
-     'pin': [1]
+     'pin': [1],
+     'work': [10000]
 }
+
+
+def run_dir_id(params: dict) -> str:
+    """Canonical name for one parameter combination's output directory.
+
+    Work size is part of the identity: without it, re-sweeping the same
+    lock/threads/pin at a different CS length would collide with the previous
+    result and be silently skipped by the resume check in _run_complete."""
+    return f"{params['lock']}_{params['threads']}_{params['pin']}_w{params['work']}"
 
 CMAKE_CACHE_PATH = 'build/CMakeCache.txt'
 
@@ -54,10 +74,10 @@ def _assert_release_build(cmake_cache_path: str = CMAKE_CACHE_PATH) -> None:
 
 offset_file_path = 'files/rdtsc_offsets.txt'
 
-process = psutil.Process(os.getpid())
-
 def report_memory():
-    rss = process.memory_info().rss / (1024 ** 3)
+    if psutil is None:
+        return
+    rss = psutil.Process(os.getpid()).memory_info().rss / (1024 ** 3)
     print(f"RSS: {rss:.2f} GiB", flush=True)
 
 
@@ -78,7 +98,8 @@ class Runner:
         threads = self.params['threads']
         pin = self.params['pin']
         lock = self.params['lock']
-        filename = f'{lock}_{threads}_{pin}_{self.iteration_name}.bin'
+        work = self.params['work']
+        filename = f'{run_dir_id(self.params)}_{self.iteration_name}.bin'
         out_file = f'{self.output_dir}/{filename}'
 
         print(f"iteration {self.iteration_name} with params: {self.params} ...")
@@ -89,6 +110,7 @@ class Runner:
                 str(threads),
                 str(pin),
                 lock,
+                str(work),
                 out_file
             ], 
             check=True
@@ -148,26 +170,37 @@ def _run_complete(csv_output_dir: str, run_name: str) -> bool:
     return True
 
 
-def run_permutations(csv_dir: str, log_dir: str='files/logs'):
+def run_permutations(csv_dir: str, log_dir: str='files/logs',
+                     space: dict | None = None, reps: int = 10) -> list[str]:
+    """Sweep every combination in `space`, `reps` runs each.
+
+    Returns the run directory names produced, so the caller can scope the
+    (expensive) averaging and per-run plotting to just this sweep instead of
+    reprocessing every directory left behind by earlier ones."""
     _assert_release_build()
 
-    keys = param_space.keys()
-    values = param_space.values()
+    if space is None:
+        space = param_space
+
+    keys = space.keys()
+    values = space.values()
 
     product_space = list(product(*values))
+    dir_ids = []
 
     for params in product_space:
         params_dict = dict(zip(keys, params))
 
-        dir_id = f"{params_dict['lock']}_{params_dict['threads']}_{params_dict['pin']}"
+        dir_id = run_dir_id(params_dict)
+        dir_ids.append(dir_id)
         output_dir = f"{log_dir}/{dir_id}"
         csv_output_dir = f"{csv_dir}/{dir_id}"
 
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(csv_output_dir, exist_ok=True)
         print(f"starting runs with with params: {params_dict}")
-        # avg across 10 runs
-        for i in range(10):
+        # avg across `reps` runs
+        for i in range(reps):
             # Resume/checkpoint: skip iterations whose parquet outputs already
             # exist and are valid, so a sweep killed partway (e.g. by the machine
             # crashing) can be re-launched and pick up where it left off instead
@@ -182,6 +215,8 @@ def run_permutations(csv_dir: str, log_dir: str='files/logs'):
             # trip the OOM killer on a later, larger run.
             del runner
             gc.collect()
+
+    return dir_ids
 
 
 # if __name__ == "__main__":

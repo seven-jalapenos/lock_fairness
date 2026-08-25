@@ -3,6 +3,7 @@
 #include <iterator>
 #include <memory>
 #include <string>
+#include <stdexcept>
 #include <sys/types.h>
 #include <thread>
 #include <vector>
@@ -47,7 +48,16 @@ std::unique_ptr<std::barrier<>> sync_point; // will be re-initialized in main wi
 // 2. warmup phase with nops until main thread signals start
 // 3. benchmark phase: repeatedly acquire the lock, simulate work, release lock
 //   - timestamps are recorded immediately before lock invocation, immediately after lock acquisition, and immediately before lock release
-// look at simulated work, I will probably need to change it to something else if it is optimized away by the compiler
+// Simulated critical section. The empty asm consumes x so the loop survives -O3;
+// `iterations` is the CS length knob driven from the command line.
+static inline __attribute__((always_inline)) void simulate_work(int iterations) {
+    int x = 0;
+    for (int i = 0; i < iterations; i++) {
+        x += i;
+    }
+    asm volatile("" :: "r"(x));
+}
+
 void worker(int thread_id, int core_id, Lock* lock, int iterations) {
     init_thread_log();
     if (core_id >= 0) {
@@ -59,6 +69,8 @@ void worker(int thread_id, int core_id, Lock* lock, int iterations) {
     // phase 1: warmup
     while(!start.load(std::memory_order_relaxed)) {
         lock->lock();
+        COMPILER_BARRIER();
+        simulate_work(iterations);
         COMPILER_BARRIER();
         lock->unlock();
     }
@@ -76,12 +88,7 @@ void worker(int thread_id, int core_id, Lock* lock, int iterations) {
         COMPILER_BARRIER();
         _mm_lfence();
 
-        // simulated work
-        int x = 0;
-        for (int i = 0; i < iterations; i++) {
-            x += i;
-        }
-        asm volatile("" :: "r"(x));
+        simulate_work(iterations);
 
         COMPILER_BARRIER();
         uint64_t lock_release = __rdtscp(&aux);  // timestamp immediately before lock release
@@ -98,7 +105,7 @@ void worker(int thread_id, int core_id, Lock* lock, int iterations) {
 
 /////////////////////////////////////////////////////////////
 //
-//      ARGS: [num_threads(>0)] [core_pin_policy] [lock_type] [iteration number] [filename(optional)]
+//      ARGS: [num_threads(>0)] [core_pin_policy] [lock_type] [work] [filename(optional)]
 //      
 //      num_threads: number of worker threads to spawn
 //      core_pin_policy: 0 (no pinning)
@@ -110,13 +117,15 @@ void worker(int thread_id, int core_id, Lock* lock, int iterations) {
 //                 ticket
 //                 ttas
 //                 ttasb (ttas with backoff)
+//                 tsspin
+//                 hash
 // 
-//      iteration number: number of iterations in critical section
+//      work: number of iterations of busy-work in the critical section
 //
 //      filename: name of output binary log file (optional, if not provided, will be generated based on other parameters)
 //
 //      Run with all or no arguments
-//      If run with no arguments, defaults to 8 threads, round-robin pinning, MCS lock and 1000 iterations.
+//      If run with no arguments, defaults to 8 threads, round-robin pinning, MCS lock and 10000 iterations.
 //
 //
 
@@ -132,13 +141,34 @@ int main(int argc, char* argv[]) {
         pin = std::atoi(argv[2]);
         lock_type = argv[3];
     } 
+    // argv[4] used to be the output filename; it is now the CS work size. Reject a
+    // non-numeric value outright rather than letting atoi turn a stale 4-arg
+    // invocation into a silent zero-work run written to the fallback path.
+    if (argc >= 5) {
+        std::string work_arg = argv[4];
+        size_t consumed = 0;
+        bool valid = !work_arg.empty();
+        if (valid) {
+            try {
+                work = std::stoi(work_arg, &consumed);
+            } catch (const std::exception&) {
+                valid = false;
+            }
+        }
+        if (!valid || consumed != work_arg.size() || work < 0) {
+            std::cerr << "Invalid work argument: " << work_arg << "\n"
+                      << "Usage: lock_exe [num_threads] [core_pin_policy] [lock_type] [work] [filename(optional)]\n";
+            return 1;
+        }
+    }
     // set filename
-    if (argc == 5) {
-        filename = argv[4];
+    if (argc >= 6) {
+        filename = argv[5];
     } else {
         filename = LOG_DIR + "log_" + lock_type +
                    "_" + std::to_string(num_threads) +
-                   "threads_pin" + std::to_string(pin) + ".bin";
+                   "threads_pin" + std::to_string(pin) +
+                   "_w" + std::to_string(work) + ".bin";
     }
 
     // set pinning policy and generate core ids for each thread
