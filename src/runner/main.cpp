@@ -21,6 +21,7 @@
 #include "ttas_lock.hpp"
 #include "ttas_backoff_lock.hpp"
 #include "tsspin_lock.hpp"
+#include "tssel_lock.hpp"
 #include "hash_lock.hpp"
 
 #define COMPILER_BARRIER() asm volatile("" ::: "memory")
@@ -110,6 +111,9 @@ void worker(int thread_id, int core_id, Lock* lock, int iterations) {
 //                 ticket
 //                 ttas
 //                 ttasb (ttas with backoff)
+//                 tsspin
+//                 tssel (timestamp-selection handoff)
+//                 hash
 // 
 //      iteration number: number of iterations in critical section
 //
@@ -181,6 +185,8 @@ int main(int argc, char* argv[]) {
         lock = std::make_unique<TTASLock_Backoff>();
     } else if (lock_type == "tsspin"){
         lock = std::make_unique<TSSpinLock>();
+    } else if (lock_type == "tssel") {
+        lock = std::make_unique<TSSelectLock>();
     } else if (lock_type == "hash") {
         lock = std::make_unique<HashLock>();
     }

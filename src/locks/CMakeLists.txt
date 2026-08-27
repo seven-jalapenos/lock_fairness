@@ -6,6 +6,7 @@ add_library(locks STATIC
     ttas_backoff_lock.cpp
     ttas_lock.cpp
     tsspin_lock.cpp
+    tssel_lock.cpp
     hash_lock.cpp
     dumb_hash_map.cpp
 )
