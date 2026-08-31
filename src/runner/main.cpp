@@ -123,8 +123,9 @@ void worker(int thread_id, int core_id, Lock* lock, int iterations) {
 //      num_threads: number of worker threads to spawn
 //      core_pin_policy: 0 (no pinning)
 //                       1 (round-robin pinning)
-//                       2 (pin all threads to one core)
-//                       3 (1/2 threads on core 0, 1/2 round-robin on remaining cores)
+//                       2 (pin all threads to the hot core, nproc/2)
+//                       3 (1/2 threads on the hot core, 1/2 round-robin over the
+//                          remaining cores -- the two groups are disjoint)
 //      lock_type: mcs
 //                 clh
 //                 ticket
@@ -189,25 +190,36 @@ int main(int argc, char* argv[]) {
     // -1 means no pinning
     std::vector<std::thread> threads;
     std::vector<int> core_ids(num_threads, -1);
+    // Mirrored by core_for_thread() in analysis/log_parser.py, which needs the
+    // thread -> core map to apply per-core TSC calibration. Change both together.
+    const int nproc = sysconf(_SC_NPROCESSORS_ONLN);
+    const int hot_core = nproc / 2;
     if (pin == 1) {
         for (int i = 0; i < num_threads; i++) {
-            core_ids[i] = i % sysconf(_SC_NPROCESSORS_ONLN);
+            core_ids[i] = i % nproc;
         }
     } else if (pin == 2) {
-        int hot_core = sysconf(_SC_NPROCESSORS_ONLN) / 2;
         for (int i = 0; i < num_threads; i++) {
             core_ids[i] = hot_core;
         }
     } else if (pin == 3) {
-        int hot_core = sysconf(_SC_NPROCESSORS_ONLN) / 2;
         int half = num_threads / 2;
 
         for (int i = 0; i < half; i++) {
             core_ids[i] = hot_core;
         }
 
+        // The cold half round-robins over every core *except* the hot one. A plain
+        // `% nproc` wraps back onto hot_core once num_threads exceeds the core
+        // count, putting "cold" threads on the contended core and diluting the
+        // exact hot/cold contrast this policy exists to create.
         for (int i = half; i < num_threads; i++) {
-            core_ids[i] = (i - half) % sysconf(_SC_NPROCESSORS_ONLN);
+            if (nproc <= 1) {
+                core_ids[i] = 0;
+                continue;
+            }
+            int slot = (i - half) % (nproc - 1);
+            core_ids[i] = (slot < hot_core) ? slot : slot + 1;
         }
     }
 

@@ -18,7 +18,7 @@ from analysis import create_global_timeline
 
 # Valid lock names, mirroring the dispatch in src/runner/main.cpp. Kept here so
 # the CLI can reject a typo before burning a sweep on it.
-LOCK_TYPES = ['mcs', 'clh', 'ticket', 'ttas', 'ttasb', 'tsspin', 'hash']
+LOCK_TYPES = ['mcs', 'clh', 'ticket', 'ttas', 'ttasb', 'tsspin', 'tssel', 'hash']
 
 param_space = {
      'lock': ['mcs', 'clh', 'ticket', 'ttas', 'ttasb', 'tsspin'],

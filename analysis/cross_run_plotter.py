@@ -4,6 +4,8 @@ from pathlib import Path
 import re
 from typing import Callable, Dict, Any, Optional
 
+from .log_analyzer import WINDOW_SIZES_CYCLES, WINDOW_LABELS
+
 class CrossRunPlotter:
     """
     Aggregates scalar metrics across multiple run directories and generates 
@@ -193,3 +195,82 @@ class CrossRunPlotter:
         plt.close()
         
         print(f"Saved cross-run plot to: {out_path}")
+
+    def plot_timescale(self, where: Optional[Dict[str, Any]] = None,
+                       name_suffix: str = '', threads: Optional[int] = None) -> None:
+        """
+        Fairness against the timescale it is measured over: windowed Jain index
+        vs window size, one line per lock.
+
+        A single fairness number is always a number at some timescale. A lock
+        that hands out equal shares over ten seconds but grants the lock in long
+        same-thread bursts scores well at a coarse window and badly at a fine
+        one; a strictly rotating lock is flat across all of them. The shape of
+        this curve is the distinction, and no scalar carries it.
+        """
+        if self.aggregated_data.empty:
+            print("No data to plot. Call load_data() first.")
+            return
+
+        df = self.aggregated_data
+        if where:
+            for key, value in where.items():
+                if key not in df.columns:
+                    continue
+                mask = df[key].isna() if value is None else df[key] == value
+                df = df[mask]
+
+        if df.empty:
+            return
+
+        # Contention is what makes the timescale question interesting, so default
+        # to the busiest configuration measured.
+        if threads is None:
+            threads = int(df['threads'].max())
+        df = df[df['threads'] == threads]
+        if df.empty:
+            return
+
+        windows = sorted(WINDOW_SIZES_CYCLES)
+
+        plt.figure(figsize=(10, 6))
+        drew_any = False
+
+        for lock, group in df.groupby('lock_type'):
+            xs, ys, errs = [], [], []
+            for cycles in windows:
+                row = group[group['Metric'] == f'windowed_jain_{WINDOW_LABELS[cycles]}']
+                if row.empty:
+                    continue
+                xs.append(cycles)
+                ys.append(float(row['Average'].iloc[0]))
+                errs.append(float(row['Standard_Deviation'].iloc[0]))
+
+            if not xs:
+                continue
+
+            drew_any = True
+            plt.errorbar(xs, ys, yerr=errs, marker='o', capsize=5,
+                         label=str(lock).upper(), linestyle='-', linewidth=2)
+
+        if not drew_any:
+            plt.close()
+            return
+
+        plt.xscale('log')
+        plt.xticks(windows, [WINDOW_LABELS[w] for w in windows])
+        title = f"Windowed Jain Index vs Window Size ({threads} threads)"
+        if where:
+            title += " (" + ", ".join(f"{k}={v}" for k, v in where.items()) + ")"
+        plt.title(title, fontsize=14)
+        plt.xlabel("Window Size (TSC cycles)", fontsize=12)
+        plt.ylabel("Jain Fairness Index (1.0 = equal shares)", fontsize=12)
+        plt.legend(title="Lock Type")
+        plt.grid(True, linestyle='--', alpha=0.6)
+        plt.tight_layout()
+
+        out_path = self.figures_dir / f"cross_run_windowed_jain_by_window{name_suffix}.png"
+        plt.savefig(out_path, dpi=300)
+        plt.close()
+
+        print(f"Saved timescale plot to: {out_path}")
