@@ -92,6 +92,8 @@ class Runner:
         self.output_dir = output_dir
         self.csv_dir = csv_dir
         self.iteration_name = iteration_name
+        # Set by __call__ if lock_exe reported a filled log buffer.
+        self.saturated = False
     
     def __call__(self) -> None:
 
@@ -104,7 +106,11 @@ class Runner:
 
         print(f"iteration {self.iteration_name} with params: {self.params} ...")
 
-        subprocess.run(
+        # lock_exe is silent on both streams in the normal path (find_offsets writes
+        # only to its file), so anything on stderr is worth echoing verbatim. The
+        # saturation marker can't be recovered from the log file itself -- a
+        # truncated log looks exactly like a short one.
+        proc = subprocess.run(
             [
                 './build/bin/lock_exe',
                 str(threads),
@@ -113,8 +119,13 @@ class Runner:
                 str(work),
                 out_file
             ], 
-            check=True
+            check=True,
+            stderr=subprocess.PIPE,
+            text=True
         )
+        if proc.stderr:
+            print(proc.stderr, end='', flush=True)
+        self.saturated = 'LOG_SATURATED' in proc.stderr
 
         log_mb = os.path.getsize(out_file) / 1e6
         print(f"done (log {log_mb:.1f} MB)", flush=True)
@@ -171,12 +182,15 @@ def _run_complete(csv_output_dir: str, run_name: str) -> bool:
 
 
 def run_permutations(csv_dir: str, log_dir: str='files/logs',
-                     space: dict | None = None, reps: int = 10) -> list[str]:
+                     space: dict | None = None,
+                     reps: int = 10) -> tuple[list[str], list[str]]:
     """Sweep every combination in `space`, `reps` runs each.
 
-    Returns the run directory names produced, so the caller can scope the
-    (expensive) averaging and per-run plotting to just this sweep instead of
-    reprocessing every directory left behind by earlier ones."""
+    Returns (dir_ids, saturated). `dir_ids` are the run directory names produced,
+    so the caller can scope the (expensive) averaging and per-run plotting to just
+    this sweep instead of reprocessing every directory left behind by earlier ones.
+    `saturated` names the runs whose log buffer filled -- their metrics are
+    truncated and shouldn't be trusted."""
     _assert_release_build()
 
     if space is None:
@@ -187,6 +201,7 @@ def run_permutations(csv_dir: str, log_dir: str='files/logs',
 
     product_space = list(product(*values))
     dir_ids = []
+    saturated = []
 
     for params in product_space:
         params_dict = dict(zip(keys, params))
@@ -210,13 +225,26 @@ def run_permutations(csv_dir: str, log_dir: str='files/logs',
                 continue
             runner = Runner(params_dict, output_dir, csv_output_dir, str(i))
             runner()
+            if runner.saturated:
+                saturated.append(f"{dir_id} iter {i}")
             # The parse builds several large DataFrames per run; drop them and
             # force a collection so RSS doesn't ratchet up across the sweep and
             # trip the OOM killer on a later, larger run.
             del runner
             gc.collect()
 
-    return dir_ids
+    # A warning printed 1600 runs ago isn't actionable; the list is. Only covers
+    # runs actually executed here -- iterations skipped by the resume check above
+    # were never re-run, so their saturation state is unknown.
+    if saturated:
+        print(f"\nWARNING: {len(saturated)} run(s) filled the log buffer and are "
+              f"truncated (of those executed this invocation):", flush=True)
+        for name in saturated:
+            print(f"  {name}", flush=True)
+        print("Raise LOG_BUDGET_BYTES or shorten DURATION and re-run these.\n",
+              flush=True)
+
+    return dir_ids, saturated
 
 
 # if __name__ == "__main__":

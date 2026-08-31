@@ -1,4 +1,5 @@
 
+#include <algorithm>
 #include <emmintrin.h>
 #include <iterator>
 #include <memory>
@@ -26,13 +27,24 @@
 
 #define COMPILER_BARRIER() asm volatile("" ::: "memory")
 
-// Capacity of per-thread log buffer. At 24 bytes/entry this is ~200 MiB/thread
-// (~11 GiB reserved at 56 threads). The old 1<<26 was ~1.5 GiB/thread (~84 GiB
-// at 56 threads), which let high-throughput locks (clh, ttasb) fill enough of
-// their buffers to trigger the OOM killer. A thread that exceeds this cap simply
-// stops logging (see log_event) rather than growing memory; bump it back up only
-// if a run needs to capture more than ~8.4M acquisitions from a single thread.
-constexpr int CAPACITY = 1 << 23; // ~8.4 million entries per thread
+// Log buffer sizing is a TOTAL budget, not a per-thread constant. Total events in
+// a run is set by CS length and DURATION -- the lock serializes, so thread count
+// barely moves it -- while a per-thread constant allocates in proportion to
+// threads. That is inverted: 1-thread runs saturate at 8.4M entries while
+// reserving 200 MiB, and 56-thread runs reserve 11 GiB they never fill.
+// Overridable at build time (-DLOG_BUDGET_BYTES=...) so a box can tune it without
+// editing source.
+#ifndef LOG_BUDGET_BYTES
+#define LOG_BUDGET_BYTES (12ULL << 30)   // 12 GiB, about what 56 threads reserved before
+#endif
+// Ceiling so a 1- or 2-thread run doesn't reserve the whole budget. Measured on
+// this box, a single thread turns over ~1.86e11/(work+1200) acquisitions in 10s,
+// so the worst case (work=0) is ~155M events; 1<<28 leaves ~70% headroom. Actual
+// RSS stays far below the reservation -- total events is roughly independent of
+// thread count, so touched memory peaks near 155M*24B (~3.7 GiB) no matter how
+// the budget is divided.
+constexpr size_t MAX_CAPACITY = 1 << 28; // ~268M entries, ~6.4 GiB
+constexpr size_t MIN_CAPACITY = 1 << 20; // floor for very high thread counts
 constexpr int DURATION = 10; // seconds
 constexpr int WARMUP = 3; // seconds
 std::string LOG_DIR = "../files/logs/";
@@ -223,7 +235,9 @@ int main(int argc, char* argv[]) {
     find_offsets(); // turn off for debugging
 
     sync_point = std::make_unique<std::barrier<>>(num_threads);
-    logging_init(num_threads, CAPACITY);
+    size_t per_thread = LOG_BUDGET_BYTES / (sizeof(LogEntry) * (size_t)num_threads);
+    per_thread = std::min(MAX_CAPACITY, std::max(MIN_CAPACITY, per_thread));
+    logging_init(num_threads, per_thread);
 
     for (int i = 0; i < num_threads; i++) {
         threads.emplace_back(worker, i, core_ids[i], lock.get(), work);
@@ -238,6 +252,11 @@ int main(int argc, char* argv[]) {
     for (auto& t : threads) {
         t.join();
     }
+
+    // Warn before writing: a saturated run's log is truncated, which the Python
+    // side cannot detect from the file alone. Exit status stays 0 on purpose --
+    // the sweep driver uses check=True and shouldn't die over one bad combination.
+    report_saturation();
 
     dump_logs(filename);
 

@@ -139,7 +139,7 @@ def main(argv: list[str] | None = None) -> None:
     print(f"sweeping {space} x {args.reps} reps", flush=True)
 
     try:
-        dir_ids = run_permutations(
+        dir_ids, saturated = run_permutations(
             csv_dir=str(files_dir),
             log_dir=str(args.log_dir),
             space=space,
@@ -168,9 +168,16 @@ def main(argv: list[str] | None = None) -> None:
         duration_minutes = duration / 60
         duration_hours = duration_minutes / 60
         print(f"analysis completed in {duration_hours:.2f} hours", flush=True)
+        # Carry saturation into the notification: an unattended overnight sweep is
+        # exactly the case where a truncated run would otherwise go unnoticed.
+        if saturated:
+            warning = (f"\n\nWARNING: {len(saturated)} run(s) filled the log buffer "
+                       f"and are truncated:\n" + "\n".join(saturated))
+        else:
+            warning = ""
         send_email(
             subject="Lock Fairness Analysis Completed",
-            body=f"The lock fairness analysis has completed successfully in {duration_hours:.2f} hours.",
+            body=f"The lock fairness analysis has completed successfully in {duration_hours:.2f} hours.{warning}",
             to_email="jcjurgen@go.olemiss.edu"
         )
     except Exception as e:
