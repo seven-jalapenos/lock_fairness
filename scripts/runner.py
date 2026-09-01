@@ -1,6 +1,7 @@
 
 import os
 import re
+import random
 import subprocess
 import time
 from itertools import product
@@ -183,8 +184,26 @@ def _run_complete(csv_output_dir: str, run_name: str) -> bool:
 
 def run_permutations(csv_dir: str, log_dir: str='files/logs',
                      space: dict | None = None,
-                     reps: int = 10) -> tuple[list[str], list[str]]:
+                     reps: int = 10,
+                     shuffle: bool = True,
+                     seed: int = 0) -> tuple[list[str], list[str]]:
     """Sweep every combination in `space`, `reps` runs each.
+
+    Reps are interleaved, not blocked: the outer loop is the repetition and the
+    inner loop is the parameter grid, so every combination is measured once
+    before any is measured twice. Running all reps of one combination back to
+    back instead would confine its spread to a few minutes of machine state
+    while different locks were measured hours apart, turning any slow drift
+    (frequency/thermal state, another tenant, fragmentation accumulated by the
+    sweep itself) into a systematic between-lock offset that the error bars
+    cannot see -- and every headline fairness metric is a SIMPLE_SCALAR whose
+    only spread is run-to-run, so nothing else would catch it.
+
+    `shuffle` additionally randomizes the grid order within each rep. Without
+    it interleaving is only half a fix: a fixed inner order pins each lock to
+    the same position in every pass, so a drift pattern that repeats per pass
+    survives averaging. The order is seeded by rep index, so a sweep is still
+    reproducible.
 
     Returns (dir_ids, saturated). `dir_ids` are the run directory names produced,
     so the caller can scope the (expensive) averaging and per-run plotting to just
@@ -199,30 +218,47 @@ def run_permutations(csv_dir: str, log_dir: str='files/logs',
     keys = space.keys()
     values = space.values()
 
-    product_space = list(product(*values))
+    # Resolve the grid once up front. Interleaving visits every combination in
+    # every pass, so the per-combination setup (and the dir_ids the caller uses
+    # to scope analysis) must not be redone -- or re-appended -- per rep.
+    combos = []
     dir_ids = []
-    saturated = []
-
-    for params in product_space:
+    for params in product(*values):
         params_dict = dict(zip(keys, params))
-
         dir_id = run_dir_id(params_dict)
-        dir_ids.append(dir_id)
         output_dir = f"{log_dir}/{dir_id}"
         csv_output_dir = f"{csv_dir}/{dir_id}"
 
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(csv_output_dir, exist_ok=True)
-        print(f"starting runs with with params: {params_dict}")
-        # avg across `reps` runs
-        for i in range(reps):
+
+        dir_ids.append(dir_id)
+        combos.append((params_dict, dir_id, output_dir, csv_output_dir))
+
+    saturated = []
+    total = len(combos) * reps
+    done = 0
+
+    for i in range(reps):
+        order = list(combos)
+        if shuffle:
+            random.Random(seed + i).shuffle(order)
+
+        print(f"\n=== rep {i + 1}/{reps} "
+              f"({len(order)} combinations{', shuffled' if shuffle else ''}) ===",
+              flush=True)
+
+        for params_dict, dir_id, output_dir, csv_output_dir in order:
+            done += 1
             # Resume/checkpoint: skip iterations whose parquet outputs already
             # exist and are valid, so a sweep killed partway (e.g. by the machine
             # crashing) can be re-launched and pick up where it left off instead
-            # of recomputing everything.
+            # of recomputing everything. Keyed on (combination, rep index), so it
+            # is indifferent to the order the pairs are executed in.
             if _run_complete(csv_output_dir, str(i)):
-                print(f"  skipping iteration {i} (already complete)", flush=True)
+                print(f"  skipping {dir_id} iter {i} (already complete)", flush=True)
                 continue
+            print(f"[{done}/{total}] {dir_id} iter {i}", flush=True)
             runner = Runner(params_dict, output_dir, csv_output_dir, str(i))
             runner()
             if runner.saturated:
