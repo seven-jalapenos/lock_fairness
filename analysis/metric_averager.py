@@ -1,4 +1,5 @@
 from .data_importer import import_parquet
+from .log_parser import create_global_timeline
 from .log_analyzer import (LogAnalyzer, COVERAGE_WARN_THRESHOLD,
                            WINDOW_SIZES_CYCLES, WINDOW_LABELS)
 from .defs import Stats
@@ -9,7 +10,6 @@ import numpy as np
 from typing import Dict, Any
 
 data_dir = 'data'
-timeline_dir = 'timeline'
 
 # Metrics that are already a per-run summary (a percentile, a fairness index, a
 # ratio). There is no within-run variance to combine for these, so they are
@@ -38,7 +38,6 @@ class MetricAverager:
     def __init__(self, run_dir: Path):
         self.run_dir: Path = run_dir
         self.data_dir: Path = run_dir / data_dir
-        self.timeline_dir: Path = run_dir / timeline_dir
 
         self.all_metrics = pd.DataFrame()
         self.metric_vars = pd.DataFrame()
@@ -46,13 +45,21 @@ class MetricAverager:
 
     def build_table(self) -> 'MetricAverager':
         self.all_metrics, self.metric_vars, self.thread_count = self.all_metrics_and_thread_count(
-            self.data_dir, self.timeline_dir
+            self.data_dir
         )
         return self
 
-    def make_analyzer(self, data_file: Path, timeline_file: Path, overtake_file: Path) -> LogAnalyzer:
+    def make_analyzer(self, data_file: Path, overtake_file: Path) -> LogAnalyzer:
         data = import_parquet(data_file)
-        timeline = import_parquet(timeline_file)
+
+        # The timeline is a melt+sort of `data`, so it is rebuilt rather than
+        # stored: persisting it doubled a run's footprint to save a couple of
+        # seconds, and a stored one silently rots. Timelines written before
+        # event_type became an int8 code hold the melted strings, which compare
+        # unequal to ACQUISITION for every row -- yielding empty metrics rather
+        # than an error. Rebuilding costs far less than the overtake scan that
+        # follows and can't be stale by construction.
+        timeline = create_global_timeline(data)
 
         if overtake_file is not None and overtake_file.exists():
             overtake = import_parquet(overtake_file)
@@ -67,20 +74,24 @@ class MetricAverager:
         la.print_overtake(overtake_file)
         return la
 
-    def all_metrics_and_thread_count(self, data_dir: Path, timeline_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, int]:
+    def all_metrics_and_thread_count(self, data_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, int]:
         """
         Returns DataFrame with metrics from every run
         """
-        data_files = sorted(data_dir.glob('*.parquet'))
-        timeline_files = sorted(timeline_dir.glob('*.parquet'))
+        data_files = sorted(data_dir.glob('*_data.parquet'))
 
         run_records = []
         var_records = []
         threads = 0
 
-        for run, (data_file, timeline_file) in enumerate(zip(data_files, timeline_files)):
-            overtake_file = self.run_dir / 'overtake' / timeline_file.name
-            analyzer = self.make_analyzer(data_file, timeline_file, overtake_file)
+        # The data parquet is the only file guaranteed to exist per iteration;
+        # its siblings are derived from its name rather than zipped against a
+        # second glob, which paired by sort position and would silently drop
+        # runs against a partially-populated directory.
+        for run, data_file in enumerate(data_files):
+            stem = data_file.name[:-len('_data.parquet')]
+            overtake_file = self.run_dir / 'overtake' / f'{stem}_timeline.parquet'
+            analyzer = self.make_analyzer(data_file, overtake_file)
             if not threads:
                 threads = analyzer.num_threads
 

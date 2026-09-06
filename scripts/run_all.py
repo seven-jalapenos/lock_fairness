@@ -107,6 +107,12 @@ def build_parser() -> argparse.ArgumentParser:
         '--log-dir', type=Path, default=Path('files/logs'),
         help='raw binary log tree (default: %(default)s)'
     )
+    parser.add_argument(
+        '--keep-logs', action='store_true',
+        help='keep each run\'s binary log after its parquet is written '
+             '(default: delete it -- the parquet holds the same events at a '
+             'sixth of the size, and nothing reads the log again)'
+    )
     return parser
 
 
@@ -143,7 +149,8 @@ def main(argv: list[str] | None = None) -> None:
             csv_dir=str(files_dir),
             log_dir=str(args.log_dir),
             space=space,
-            reps=args.reps
+            reps=args.reps,
+            keep_logs=args.keep_logs
         )
         steps_completed.append("lock runs completed")
 

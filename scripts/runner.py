@@ -88,11 +88,13 @@ class Runner:
     # it should take params for the run, execute and then parse/write csv
     # implement a parameter checker
 
-    def __init__(self, params: dict, output_dir: str, csv_dir: str, iteration_name: str):
+    def __init__(self, params: dict, output_dir: str, csv_dir: str, iteration_name: str,
+                 keep_logs: bool = False):
         self.params = params
         self.output_dir = output_dir
         self.csv_dir = csv_dir
         self.iteration_name = iteration_name
+        self.keep_logs = keep_logs
         # Set by __call__ if lock_exe reported a filled log buffer.
         self.saturated = False
     
@@ -157,20 +159,28 @@ class Runner:
         pqt_writer.write_raw()
         print("done writing")
 
+        # The binary log is fully represented by the parquet just written and is
+        # never read again, so keeping it roughly triples the sweep's disk
+        # footprint. Deleting here rather than earlier means a parse or export
+        # failure raises before this line and leaves the log in place to debug.
+        if not self.keep_logs:
+            os.remove(out_file)
+            print(f"removed {filename} ({log_mb:.1f} MB reclaimed)", flush=True)
+
         log_parser.close()
         pqt_writer.close()
 
 def _run_complete(csv_output_dir: str, run_name: str) -> bool:
-    """Return True if this iteration's parquet outputs already exist AND are
-    readable, so a resumed sweep can skip it. Both the flat data and the timeline
-    parquet must be present and have a valid footer — a file truncated by a
-    mid-write crash fails the footer read and is treated as incomplete (redone),
-    so we never resume on top of a half-written, silently-bad file."""
+    """Return True if this iteration's parquet output already exists AND is
+    readable, so a resumed sweep can skip it. The flat data parquet is the only
+    artifact a run now produces; it must be present and have a valid footer — a
+    file truncated by a mid-write crash fails the footer read and is treated as
+    incomplete (redone), so we never resume on top of a half-written,
+    silently-bad file."""
     import pyarrow.parquet as pq
 
     paths = [
         os.path.join(csv_output_dir, 'data', f'{run_name}_data.parquet'),
-        os.path.join(csv_output_dir, 'timeline', f'{run_name}_timeline.parquet'),
     ]
     for p in paths:
         if not os.path.exists(p) or os.path.getsize(p) == 0:
@@ -186,7 +196,8 @@ def run_permutations(csv_dir: str, log_dir: str='files/logs',
                      space: dict | None = None,
                      reps: int = 10,
                      shuffle: bool = False,
-                     seed: int = 0) -> tuple[list[str], list[str]]:
+                     seed: int = 0,
+                     keep_logs: bool = False) -> tuple[list[str], list[str]]:
     """Sweep every combination in `space`, `reps` runs each.
 
     Reps are interleaved, not blocked: the outer loop is the repetition and the
@@ -209,7 +220,11 @@ def run_permutations(csv_dir: str, log_dir: str='files/logs',
     so the caller can scope the (expensive) averaging and per-run plotting to just
     this sweep instead of reprocessing every directory left behind by earlier ones.
     `saturated` names the runs whose log buffer filled -- their metrics are
-    truncated and shouldn't be trusted."""
+    truncated and shouldn't be trusted.
+
+    `keep_logs` retains each run's binary log instead of deleting it once its
+    parquet is written. Off by default: the logs are ~6x the parquet across a
+    sweep and nothing reads them again."""
     _assert_release_build()
 
     if space is None:
@@ -259,7 +274,7 @@ def run_permutations(csv_dir: str, log_dir: str='files/logs',
                 print(f"  skipping {dir_id} iter {i} (already complete)", flush=True)
                 continue
             print(f"[{done}/{total}] {dir_id} iter {i}", flush=True)
-            runner = Runner(params_dict, output_dir, csv_output_dir, str(i))
+            runner = Runner(params_dict, output_dir, csv_output_dir, str(i), keep_logs)
             runner()
             if runner.saturated:
                 saturated.append(f"{dir_id} iter {i}")

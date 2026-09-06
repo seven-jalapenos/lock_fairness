@@ -111,7 +111,10 @@ class LogAnalyzer:
         """
         assert(self._overtake_timeline is not None)
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        self._overtake_timeline.to_parquet(file_path)
+        # One row per operation, so this is the same order of magnitude as the
+        # run's raw data. It stays a cache -- it saves the O(N*t) rescan on
+        # re-averaging -- but there's no reason to store it uncompressed.
+        self._overtake_timeline.to_parquet(file_path, compression='zstd')
 
 #############################
 #
