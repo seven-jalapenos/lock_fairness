@@ -185,7 +185,7 @@ def _run_complete(csv_output_dir: str, run_name: str) -> bool:
 def run_permutations(csv_dir: str, log_dir: str='files/logs',
                      space: dict | None = None,
                      reps: int = 10,
-                     shuffle: bool = True,
+                     shuffle: bool = False,
                      seed: int = 0) -> tuple[list[str], list[str]]:
     """Sweep every combination in `space`, `reps` runs each.
 
