@@ -129,6 +129,47 @@ def truncated_rotation(num_threads: int, rounds: int) -> list:
     return per_thread
 
 
+def silent_thread(num_threads: int, rounds: int) -> list:
+    """A fair rotation among all but the highest-numbered thread, which never
+    acquires and so logs nothing at all.
+
+    This is the shape a starved thread leaves behind: it writes a zero-count
+    block, contributes no rows, and is invisible to anything that counts the
+    thread ids present in the data. With one silent thread out of n the
+    completion counts are (c,...,c,0), so Jain's index is
+    ((n-1)c)^2 / (n * (n-1)c^2) = (n-1)/n exactly."""
+    per_thread = fair_rotation(num_threads - 1, rounds)
+    per_thread.append([])
+    return per_thread
+
+
+def random_contention(num_threads: int, grants: int, seed: int = 0) -> list:
+    """A messy but physically valid log: threads are granted in a random order
+    with varying waits, and no thread ever has two operations in flight.
+
+    Exists to exercise the overtake scan on something with a nontrivial mix of
+    depths, rather than the hand-built fixtures whose answers are round numbers.
+    """
+    rng = np.random.default_rng(seed)
+    ready = np.full(num_threads, BASE, dtype=np.int64)
+    per_thread = [[] for _ in range(num_threads)]
+    clock = BASE
+    for _ in range(grants):
+        waiting = np.flatnonzero(ready <= clock)
+        if waiting.size == 0:
+            clock = int(ready.min())
+            waiting = np.flatnonzero(ready <= clock)
+        tid = int(waiting[rng.integers(0, waiting.size)])
+        # A real operation always has a nonzero wait: two TSC reads and an lfence
+        # sit between the invocation and acquisition timestamps.
+        clock = max(clock, int(ready[tid]) + 1)
+        hold = int(rng.integers(2, 40))
+        per_thread[tid].append((int(ready[tid]), clock, clock + hold))
+        ready[tid] = clock + hold + int(rng.integers(1, 30))
+        clock += hold + int(rng.integers(1, 10))
+    return per_thread
+
+
 #############################
 #
 #          HARNESS
@@ -164,7 +205,9 @@ def analyzer_for(per_thread_events, pin: int, num_cores: int = 8,
     parser = LogParser(str(log_path), str(offset_path), pin)
     data = parser.all_threads_data
     timeline = create_global_timeline(data)
-    return LogAnalyzer(data, timeline)
+    # The fixture knows how many threads it wrote; a silent thread contributes no
+    # rows, so the count cannot be recovered from `data`.
+    return LogAnalyzer(data, timeline, num_threads=len(per_thread_events))
 
 
 def check_pin_mapping(c: Checker) -> None:
@@ -285,6 +328,158 @@ def check_overtakes(c: Checker) -> None:
                tight.ordering_ambiguity_fraction(), 1.0)
 
 
+def check_silent_thread(c: Checker) -> None:
+    """A thread that completes nothing must still be counted.
+
+    It is the single most consequential case in the whole pipeline: inferring the
+    thread count from the data drops exactly the starved threads, which removes
+    their zero from per_thread_throughput and reports the least fair run possible
+    as perfectly fair."""
+    print("\nfixture: 4 threads, the highest-numbered one never acquires")
+    a = analyzer_for(silent_thread(4, 400), pin=1, tag='silent')
+
+    c.check("num_threads == 4 despite thread 3 logging nothing",
+            a.num_threads == 4, f"(got {a.num_threads})")
+    counts = a.per_thread_throughput()
+    c.check("per_thread_throughput has 4 entries", len(counts) == 4,
+            f"(got {len(counts)})")
+    c.check("the silent thread's entry is 0", counts[-1] == 0, f"(got {counts[-1]})")
+    # (n-1)/n for one silent thread out of n.
+    c.close_to("throughput_jain_index == 0.75", a.throughput_jain_index(), 0.75,
+               tol=1e-12)
+    ratio = a.throughput_ratio()
+    c.check("throughput_ratio is nan (a thread completed nothing)",
+            math.isnan(ratio), f"(got {ratio})")
+
+
+def check_ragged_reps(c: Checker) -> None:
+    """Reps of one combination must agree on their per-thread array length.
+
+    When one rep starves a thread and another doesn't, an inferred thread count
+    differs between them and the np.stack in find_means_and_stds raises, taking
+    down the averaging pass for the whole run directory."""
+    print("\nend to end: reps that disagree on which threads logged")
+    run_dir = OUT_ROOT / 'pqt_ragged' / 'ttas_4_1_w1000'
+    if run_dir.exists():
+        shutil.rmtree(run_dir)
+
+    for rep, events in enumerate((fair_rotation(4, 300), silent_thread(4, 300))):
+        a = analyzer_for(events, pin=1, tag=f'ragged_{rep}')
+        exporter = DataExporter(a._data, a._global_timeline, str(run_dir), str(rep))
+        exporter.write_raw()
+        exporter.close()
+
+    try:
+        averager = MetricAverager(run_dir).build_table()
+        stats = averager.find_means_and_stds()
+        c.check("averaging survives a rep with a silent thread", True)
+        c.check("thread count taken from the directory name",
+                averager.thread_count == 4, f"(got {averager.thread_count})")
+        c.check("per-thread throughput stats cover all 4 threads",
+                len(stats['per_thread_throughput']) == 4)
+    except Exception as e:  # noqa: BLE001 - reporting is the point
+        c.check("averaging survives a rep with a silent thread", False,
+                f"raised {e!r}")
+
+
+def _reference_overtake_timeline(timeline):
+    """The per-event scan the vectorized implementation replaced.
+
+    Kept here as an oracle: the rewrite is only reviewable if the two are checked
+    against each other on every fixture."""
+    from analysis.defs import INVOCATION, ACQUISITION
+    import pandas as pd
+
+    if timeline.empty:
+        return pd.DataFrame(columns=['invocation_time', 'thread_id',
+                                     'intervening_acquisitions',
+                                     'ambiguous_acquisitions'])
+    ts = timeline['timestamp'].to_numpy()
+    ev = timeline['event_type'].to_numpy()
+    tid = timeline['thread_id'].to_numpy()
+    pending = {}
+    results = []
+    for timestamp, event_type, thread_id in zip(ts, ev, tid):
+        if event_type == INVOCATION:
+            results.append([timestamp, thread_id, 0, 0])
+            pending[thread_id] = (timestamp, len(results) - 1)
+        elif event_type == ACQUISITION and thread_id in pending:
+            acq_inv_time, _ = pending.pop(thread_id)
+            for other_inv_time, other_idx in pending.values():
+                if acq_inv_time > other_inv_time:
+                    results[other_idx][2] += 1
+                    if acq_inv_time - other_inv_time <= AMBIGUITY_CYCLES:
+                        results[other_idx][3] += 1
+    return pd.DataFrame(results, columns=['invocation_time', 'thread_id',
+                                          'intervening_acquisitions',
+                                          'ambiguous_acquisitions'])
+
+
+def check_overtake_equivalence(c: Checker) -> None:
+    """The vectorized overtake scan must reproduce the per-event scan exactly."""
+    print("\novertake scan: vectorized vs. the per-event reference")
+    fixtures = [
+        ('fair rotation', fair_rotation(4, 300)),
+        ('starved pair', starved_pair(300)),
+        ('overtaking pair, wide gap', overtaking_pair(200, gap=AMBIGUITY_CYCLES * 25)),
+        ('overtaking pair, tight gap', overtaking_pair(200, gap=AMBIGUITY_CYCLES // 4)),
+        ('random contention, 8 threads', random_contention(8, 1500, seed=1)),
+        ('random contention, 24 threads', random_contention(24, 3000, seed=2)),
+    ]
+    for name, events in fixtures:
+        a = analyzer_for(events, pin=1, tag=f'equiv_{abs(hash(name)) % 10**6}')
+        want = _reference_overtake_timeline(a._global_timeline)
+        got = a._overtake_timeline
+
+        if len(want) != len(got):
+            c.check(f"{name}: same row count", False,
+                    f"(got {len(got)}, want {len(want)})")
+            continue
+        # Both are emitted in invocation order; equal invocation timestamps may
+        # order differently between them, so compare as sorted multisets.
+        cols = list(want.columns)
+        w = want.sort_values(cols, ignore_index=True)
+        g = got.sort_values(cols, ignore_index=True)
+        mismatched = [col for col in cols
+                      if not np.array_equal(w[col].to_numpy(), g[col].to_numpy())]
+        c.check(f"{name}: identical to the reference scan", not mismatched,
+                f"(columns differing: {mismatched})")
+        c.check(f"{name}: dtypes preserved",
+                list(w.dtypes) == list(g.dtypes),
+                f"({list(g.dtypes)} vs {list(w.dtypes)})")
+
+
+def check_offsets_parsing(c: Checker) -> None:
+    """Offset files must survive a negative offset, however it was written."""
+    print("\ncalibration: offset file parsing")
+    from analysis.parse_offsets import parse_tsc_offsets
+
+    path = OUT_ROOT / 'offsets_legacy.txt'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # find_offsets used to compute offsets unsigned and print them with %lu, so a
+    # core whose TSC trailed core 0 landed in the file as its 2^64 complement.
+    # Reading that into an int64 array raises OverflowError outright.
+    path.write_text(
+        "Core 0: 0 cycles\n"
+        f"Core 1: {(1 << 64) - 500} cycles\n"
+        "Core 2: -250 cycles\n"
+        f"Core 3: {(1 << 64) - 1} cycles\n"
+    )
+    try:
+        parsed = parse_tsc_offsets(str(path))
+        c.check("legacy unsigned-wrapped offset file parses", parsed is not None)
+        if parsed is not None:
+            c.check("wrapped value folds to its negative", parsed[1] == -500,
+                    f"(got {parsed[1]})")
+            c.check("already-signed value passes through", parsed[2] == -250,
+                    f"(got {parsed[2]})")
+            c.check("old UINT64_MAX sentinel folds to -1", parsed[3] == -1,
+                    f"(got {parsed[3]})")
+    except Exception as e:  # noqa: BLE001 - reporting is the point
+        c.check("legacy unsigned-wrapped offset file parses", False,
+                f"raised {e!r}")
+
+
 def check_truncation(c: Checker) -> None:
     print("\nfixture: truncated log (thread 0's buffer fills halfway)")
     a = analyzer_for(truncated_rotation(4, 500), pin=1, tag='truncated')
@@ -389,10 +584,14 @@ def main() -> int:
     check_jain_closed_form(c)
     check_fair_rotation(c)
     check_starvation(c)
+    check_silent_thread(c)
     check_overtakes(c)
+    check_overtake_equivalence(c)
     check_truncation(c)
     check_calibration(c)
+    check_offsets_parsing(c)
     check_end_to_end(c)
+    check_ragged_reps(c)
 
     print(f"\n{c.checks - len(c.failures)}/{c.checks} checks passed")
     if c.failures:

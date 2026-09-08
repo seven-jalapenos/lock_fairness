@@ -2,7 +2,7 @@ from .data_importer import import_parquet
 from .log_parser import create_global_timeline
 from .log_analyzer import (LogAnalyzer, COVERAGE_WARN_THRESHOLD,
                            WINDOW_SIZES_CYCLES, WINDOW_LABELS)
-from .defs import Stats
+from .defs import Stats, parse_run_dir_id
 
 from pathlib import Path
 import pandas as pd
@@ -43,6 +43,22 @@ class MetricAverager:
         self.metric_vars = pd.DataFrame()
         self.thread_count: int = 0
 
+        # How many threads these runs spawned, read from the directory name the
+        # sweep built out of the parameters it handed lock_exe. The parquet
+        # cannot supply it: a thread that completed no critical sections wrote no
+        # rows, so counting the thread ids present drops exactly the starved ones
+        # -- which is the wrong direction, since it removes the zero from
+        # per_thread_throughput and scores the least fair runs as the most fair.
+        # It also lets reps of one combination disagree on array length, which
+        # makes the np.stack in find_means_and_stds raise.
+        params = parse_run_dir_id(run_dir.name)
+        self.declared_threads: int | None = params['threads'] if params else None
+        if self.declared_threads is None:
+            print(f"  WARNING: '{run_dir.name}' does not parse as "
+                  "<lock>_<threads>_<pin>[_w<work>]; falling back to inferring "
+                  "the thread count from the data, which omits any thread that "
+                  "completed no operations.", flush=True)
+
     def build_table(self) -> 'MetricAverager':
         self.all_metrics, self.metric_vars, self.thread_count = self.all_metrics_and_thread_count(
             self.data_dir
@@ -68,9 +84,10 @@ class MetricAverager:
             # sweep would otherwise silently reuse the old schema and report NaN
             # ambiguity forever.
             if 'ambiguous_acquisitions' in overtake.columns:
-                return LogAnalyzer(data, timeline, overtake)
+                return LogAnalyzer(data, timeline, overtake,
+                                   num_threads=self.declared_threads)
 
-        la = LogAnalyzer(data, timeline)
+        la = LogAnalyzer(data, timeline, num_threads=self.declared_threads)
         la.print_overtake(overtake_file)
         return la
 
@@ -82,7 +99,9 @@ class MetricAverager:
 
         run_records = []
         var_records = []
-        threads = 0
+        # Declared up front so every rep contributes equal-length per-thread
+        # arrays even when one of them had a thread complete nothing.
+        threads = self.declared_threads or 0
 
         # The data parquet is the only file guaranteed to exist per iteration;
         # its siblings are derived from its name rather than zipped against a

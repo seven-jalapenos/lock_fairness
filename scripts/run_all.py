@@ -108,6 +108,19 @@ def build_parser() -> argparse.ArgumentParser:
         help='raw binary log tree (default: %(default)s)'
     )
     parser.add_argument(
+        '--analysis-workers', type=int, default=0, metavar='N',
+        help='processes used to average run directories (default: auto, '
+             'min(cpu_count, 8)). Bounded by memory, not cores: a worker holds '
+             'about 0.5 GB per million critical-section completions, so short '
+             'critical sections need a lower number'
+    )
+    parser.add_argument(
+        '--calibrate-every', type=int, default=100, metavar='N',
+        help='re-measure per-core TSC offsets every N executed benchmark runs '
+             '(default: %(default)s; 0 calibrates once at the start). Runs in '
+             'between reuse files/rdtsc_offsets.txt'
+    )
+    parser.add_argument(
         '--keep-logs', action='store_true',
         help='keep each run\'s binary log after its parquet is written '
              '(default: delete it -- the parquet holds the same events at a '
@@ -150,7 +163,8 @@ def main(argv: list[str] | None = None) -> None:
             log_dir=str(args.log_dir),
             space=space,
             reps=args.reps,
-            keep_logs=args.keep_logs
+            keep_logs=args.keep_logs,
+            calibrate_every=args.calibrate_every
         )
         steps_completed.append("lock runs completed")
 
@@ -159,7 +173,8 @@ def main(argv: list[str] | None = None) -> None:
         # Step 3 is deliberately unscoped — it's the comparison figure.
 
         # Step 1: Average all metrics across runs and export to CSV
-        average_all_metrics(files_dir, only=set(dir_ids))
+        average_all_metrics(files_dir, only=set(dir_ids),
+                            workers=args.analysis_workers)
         steps_completed.append("average metrics generated")
 
         # Step 2: Plot metrics for each individual run

@@ -142,9 +142,24 @@ void worker(int thread_id, int core_id, Lock* lock, int iterations) {
 //      Run with all or no arguments
 //      If run with no arguments, defaults to 8 threads, round-robin pinning, MCS lock and 10000 iterations.
 //
+//      lock_exe --calibrate-only
+//          Re-measures the per-core TSC offsets into files/rdtsc_offsets.txt and
+//          exits. A normal run reuses that file when it already covers this
+//          machine, so the sweep driver recalibrates on an interval instead of
+//          every run paying for it.
+//
 //
 
 int main(int argc, char* argv[]) {
+    // Calibration-only mode: measure the per-core TSC offsets, write them, and
+    // exit. The sweep driver calls this on a fixed interval so the thousands of
+    // benchmark invocations between recalibrations can reuse the file instead of
+    // re-measuring, which cost seconds apiece for a value that barely moves.
+    if (argc >= 2 && std::string(argv[1]) == "--calibrate-only") {
+        find_offsets(true);
+        return 0;
+    }
+
     int num_threads = 8;
     int pin = 1;
     std::string lock_type = "mcs";
@@ -247,8 +262,10 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // find rtsc offsets for each core and save to file (used for post-processing logs)
-    find_offsets(); // turn off for debugging
+    // Per-core rdtscp offsets, used for post-processing logs. Reuses the file on
+    // disk when it already covers this machine; `--calibrate-only` forces a fresh
+    // measurement, which the sweep driver schedules on an interval.
+    find_offsets();
 
     sync_point = std::make_unique<std::barrier<>>(num_threads);
     size_t per_thread = LOG_BUDGET_BYTES / (sizeof(LogEntry) * (size_t)num_threads);

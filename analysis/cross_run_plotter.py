@@ -1,9 +1,9 @@
 import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
-import re
 from typing import Callable, Dict, Any, Optional
 
+from .defs import parse_run_dir_id
 from .log_analyzer import WINDOW_SIZES_CYCLES, WINDOW_LABELS
 
 class CrossRunPlotter:
@@ -62,30 +62,24 @@ class CrossRunPlotter:
             
         return self
 
-    # Run directories are named <lock>_<threads>_<pin>_w<work> (see
-    # scripts/runner.py:run_dir_id). Anchored, because an unanchored match would
-    # accept the `<lock>_<threads>_<pin>` prefix of a work-suffixed directory and
-    # silently collapse every work size onto one line. The work group is optional
-    # so directories from sweeps predating the work dimension still parse.
-    _DIR_PATTERN = re.compile(
-        r'^(?P<lock>[A-Za-z]+)_(?P<threads>\d+)_(?P<pin>\d+)(?:_w(?P<work>\d+))?$'
-    )
-
     def _default_param_parser(self, folder_name: str) -> Dict[str, Any]:
         """
         Parses run folder names like `mcs_8_1_w10000` (or legacy `mcs_8_1`) into
         'lock_type', 'threads', 'pin' and 'work'. Modify this if your naming differs.
+
+        Delegates to defs.parse_run_dir_id so the directory naming has exactly one
+        reader; MetricAverager reads the same name for its thread count, and two
+        copies of the pattern would be two chances to disagree with run_dir_id().
         """
-        match = self._DIR_PATTERN.match(folder_name)
-        if match:
-            work = match.group('work')
-            return {
-                'lock_type': match.group('lock'),
-                'threads': int(match.group('threads')),
-                'pin': int(match.group('pin')),
-                'work': int(work) if work is not None else None
-            }
-        return {}
+        params = parse_run_dir_id(folder_name)
+        if params is None:
+            return {}
+        return {
+            'lock_type': params['lock'],
+            'threads': params['threads'],
+            'pin': params['pin'],
+            'work': params['work'],
+        }
 
     def plot_metric(self, metric_name: str, x_axis: str, line_axis: Optional[str] = None,
                     save_csv: bool = False, where: Optional[Dict[str, Any]] = None,

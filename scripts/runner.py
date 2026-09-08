@@ -38,6 +38,12 @@ def run_dir_id(params: dict) -> str:
     return f"{params['lock']}_{params['threads']}_{params['pin']}_w{params['work']}"
 
 CMAKE_CACHE_PATH = 'build/CMakeCache.txt'
+LOCK_EXE = './build/bin/lock_exe'
+
+# How many executed runs between TSC recalibrations. lock_exe reuses an offsets
+# file that already covers the machine, so this is the only thing deciding how
+# often the measurement is actually taken.
+CALIBRATE_EVERY = 100
 
 
 def _assert_release_build(cmake_cache_path: str = CMAKE_CACHE_PATH) -> None:
@@ -115,7 +121,7 @@ class Runner:
         # truncated log looks exactly like a short one.
         proc = subprocess.run(
             [
-                './build/bin/lock_exe',
+                LOCK_EXE,
                 str(threads),
                 str(pin),
                 lock,
@@ -192,12 +198,23 @@ def _run_complete(csv_output_dir: str, run_name: str) -> bool:
     return True
 
 
+def calibrate_offsets() -> None:
+    """Re-measure per-core TSC offsets into files/rdtsc_offsets.txt.
+
+    Used to run inside every lock_exe invocation. At sweep scale that is
+    thousands of measurements of a value that barely moves, so the driver now
+    schedules it and the benchmark runs reuse the file in between."""
+    print("  recalibrating TSC offsets ...", flush=True)
+    subprocess.run([LOCK_EXE, '--calibrate-only'], check=True)
+
+
 def run_permutations(csv_dir: str, log_dir: str='files/logs',
                      space: dict | None = None,
                      reps: int = 10,
                      shuffle: bool = False,
                      seed: int = 0,
-                     keep_logs: bool = False) -> tuple[list[str], list[str]]:
+                     keep_logs: bool = False,
+                     calibrate_every: int = CALIBRATE_EVERY) -> tuple[list[str], list[str]]:
     """Sweep every combination in `space`, `reps` runs each.
 
     Reps are interleaved, not blocked: the outer loop is the repetition and the
@@ -224,7 +241,14 @@ def run_permutations(csv_dir: str, log_dir: str='files/logs',
 
     `keep_logs` retains each run's binary log instead of deleting it once its
     parquet is written. Off by default: the logs are ~6x the parquet across a
-    sweep and nothing reads them again."""
+    sweep and nothing reads them again.
+
+    `calibrate_every` re-measures the per-core TSC offsets every N *executed*
+    runs, starting with the first. Iterations skipped by the resume check don't
+    count -- they consume no machine time and produce no new timestamps. Each
+    run's log is parsed right after its subprocess exits, so the offsets applied
+    to a run are always the ones measured at its preceding calibration point.
+    0 calibrates once at the start and never again."""
     _assert_release_build()
 
     if space is None:
@@ -253,6 +277,7 @@ def run_permutations(csv_dir: str, log_dir: str='files/logs',
     saturated = []
     total = len(combos) * reps
     done = 0
+    executed = 0  # runs actually launched, which is what paces recalibration
 
     for i in range(reps):
         order = list(combos)
@@ -274,6 +299,11 @@ def run_permutations(csv_dir: str, log_dir: str='files/logs',
                 print(f"  skipping {dir_id} iter {i} (already complete)", flush=True)
                 continue
             print(f"[{done}/{total}] {dir_id} iter {i}", flush=True)
+            # Before the run, so the offsets this run's log is calibrated with
+            # were measured in the machine state it just ran in.
+            if executed == 0 or (calibrate_every > 0 and executed % calibrate_every == 0):
+                calibrate_offsets()
+            executed += 1
             runner = Runner(params_dict, output_dir, csv_output_dir, str(i), keep_logs)
             runner()
             if runner.saturated:

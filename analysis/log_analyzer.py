@@ -14,6 +14,12 @@ from .defs import INVOCATION, ACQUISITION
 # of assumed; tune per machine.
 AMBIGUITY_CYCLES = 200
 
+# Ceiling on how many (waiting operation, intervening acquisition) pairs the
+# overtake scan materializes at once. The scan is chunked to stay under it, so
+# peak memory is set by this rather than by the run's length: ~24 bytes a pair
+# across the index and mask temporaries, so ~0.8 GB here.
+OVERTAKE_PAIR_BUDGET = 32_000_000
+
 # Window sizes for the fairness-vs-timescale metric, in TSC cycles (~30us, ~300us
 # and ~3ms at 3GHz). A lock can be fair over a 10s run and badly bursty inside
 # any given millisecond; one number at one timescale can't tell those apart.
@@ -32,13 +38,39 @@ COVERAGE_WARN_THRESHOLD = 0.99
 
 class LogAnalyzer:
 
-    def __init__(self, data: pd.DataFrame, global_timeline: pd.DataFrame, overtake_timeline: Optional[pd.DataFrame]=None):
+    def __init__(self, data: pd.DataFrame, global_timeline: pd.DataFrame,
+                 overtake_timeline: Optional[pd.DataFrame] = None,
+                 num_threads: Optional[int] = None):
         self._data = data
         self._global_timeline = global_timeline
+        self.num_threads = self._resolve_num_threads(data, num_threads)
         self._overtake_timeline = overtake_timeline if overtake_timeline is not None else self.create_overtake_timeline()
-        self.num_threads = data['thread_id'].values[-1] + 1  # Assuming thread IDs are 0-indexed and contiguous
         self.operation_count = len(data)
         self.event_count = len(global_timeline)
+
+    @staticmethod
+    def _resolve_num_threads(data: pd.DataFrame, declared: Optional[int]) -> int:
+        """How many threads the run spawned -- not how many appear in the data.
+
+        A thread that completed no critical sections contributes no rows, so
+        inferring the count from the data drops it, and dropping a starved thread
+        is exactly backwards: per_thread_throughput loses its zero and Jain's
+        index reports the most unfair run possible as perfectly fair (4 threads
+        with one silent scores 1.0 instead of 0.75). It also makes the count
+        differ between reps of the same combination, which makes the np.stack in
+        MetricAverager.find_means_and_stds raise on ragged arrays.
+
+        `declared` comes from the run directory name, which the sweep built from
+        the parameters it handed lock_exe. Inference is only the fallback for
+        directories that don't carry it.
+        """
+        if declared is not None:
+            return int(declared)
+        if data is None or data.empty:
+            return 0
+        # max() rather than values[-1]: the latter also assumes the frame is
+        # still in per-thread block order, which nothing guarantees.
+        return int(data['thread_id'].max()) + 1
 
     def close(self) -> None:
         self._data = None
@@ -48,62 +80,134 @@ class LogAnalyzer:
     def create_overtake_timeline(self) -> pd.DataFrame:
         """
         Creates an operation-wise timeline of overtakes.
-        O(N*t) complexity using a chronological state-tracker.
+
+        For each operation, counts the acquisitions by *other* threads that
+        completed while it sat waiting despite having invoked later than it --
+        i.e. the times it was cut in line -- plus how many of those decisions
+        rested on an invocation gap inside the TSC noise floor.
+
+        Reduction to array work
+        -----------------------
+        Operation `i` (invoked at u_i, acquired at a_i) is pending at acquisition
+        `j` exactly when a_j lies in (u_i, a_i). Acquisitions are totally ordered
+        by the lock, so those `j` form a *contiguous range in acquisition order*:
+        `[lo_i, i)` with `lo_i = searchsorted(a_sorted, u_i, side='right')`.
+
+        Within that range the two counters are just filters on the same pairs:
+        an overtake needs `u_j > u_i`, and it is ambiguous when additionally
+        `u_j - u_i <= AMBIGUITY_CYCLES`. So one pass over the candidate pairs
+        yields both columns.
+
+        The total work is bounded: sum_i (i - lo_i) is the sum over acquisitions
+        of how many operations were pending at that moment, which is at most the
+        thread count because a thread has one operation outstanding at a time.
+        That is the same O(N*t) the per-event Python scan did, now as numpy --
+        the scan was the dominant cost of the whole analysis stage.
+
+        Works from the flat per-operation frame rather than the melted timeline,
+        so it neither needs nor pays for the 3N-row melt. That also removes two
+        artifacts of walking a melted, tie-arbitrarily-sorted event stream:
+        an operation whose wait is zero cycles could have its ACQUISITION sorted
+        ahead of its own INVOCATION, which made the per-event scan find nothing
+        pending and drop that acquisition for *every* thread it overtook; and a
+        thread appearing to invoke twice before acquiring (only reachable via bad
+        calibration) silently overwrote the earlier operation's slot, leaving it
+        at zero. Neither is reachable from a well-formed log -- two TSC reads and
+        an lfence separate invocation from acquisition -- but both are now
+        counted per operation instead of depending on sort order.
         """
-        assert(self._global_timeline is not None)
-        timeline = self._global_timeline
+        columns = ['invocation_time', 'thread_id',
+                   'intervening_acquisitions', 'ambiguous_acquisitions']
 
-        if timeline.empty:
-            return pd.DataFrame(columns=['invocation_time', 'thread_id',
-                                         'intervening_acquisitions',
-                                         'ambiguous_acquisitions'])
+        data = self._data
+        if data is None or data.empty:
+            return pd.DataFrame(columns=columns)
 
-        # 1. Drop out of Pandas into native NumPy arrays to eliminate loop overhead.
-        # Extract each column separately so every array keeps its own dtype: a
-        # single to_numpy() over mixed uint64/int8/int64 columns would coerce the
-        # whole thing to float64 (losing TSC precision) or object (huge). Assumes
-        # the timeline is already chronologically sorted by timestamp.
-        ts = timeline['timestamp'].to_numpy()
-        ev = timeline['event_type'].to_numpy()
-        tid = timeline['thread_id'].to_numpy()
+        u = data['invocation'].to_numpy()
+        a = data['acquisition'].to_numpy()
+        tid = data['thread_id'].to_numpy()
+        n = u.size
 
-        # State trackers
-        pending_invocations = {}  # thread_id -> (invocation_time, result_index)
-        results = []              # [invocation_time, thread_id, overtakes, ambiguous]
+        # Acquisition order is the order the lock actually granted, which is what
+        # makes the candidate set contiguous. Stable so equal timestamps keep the
+        # per-thread ordering the log was written in.
+        order = np.argsort(a, kind='stable')
+        u_s, a_s, t_s = u[order], a[order], tid[order]
 
-        # 2. Step through the chronological timeline O(N)
-        for timestamp, event_type, thread_id in zip(ts, ev, tid):
+        idx = np.arange(n, dtype=np.int64)
+        # First acquisition that lands after this operation invoked. Clamped
+        # because a zero-cycle wait (only reachable in synthetic fixtures) would
+        # otherwise put the bound past the operation's own position.
+        lo = np.minimum(np.searchsorted(a_s, u_s, side='right').astype(np.int64), idx)
+        width = idx - lo
 
-            if event_type == INVOCATION:
-                # Save its future index in the results array so we can increment its penalty later
-                idx = len(results)
-                results.append([timestamp, thread_id, 0, 0])
-                pending_invocations[thread_id] = (timestamp, idx)
+        intervening = np.zeros(n, dtype=np.int64)
+        ambiguous = np.zeros(n, dtype=np.int64)
+        gap_limit = np.uint64(AMBIGUITY_CYCLES)
 
-            elif event_type == ACQUISITION:
-                # The thread acquired the lock, remove it from the pending pool
-                if thread_id in pending_invocations:
-                    acq_inv_time, _ = pending_invocations.pop(thread_id)
+        # Chunked over operations so the materialized pair list stays bounded;
+        # cumulative widths let each chunk end where it would exceed the budget.
+        widths_cumulative = np.cumsum(width)
+        start = 0
+        while start < n:
+            # One operation whose wait alone blows the budget (deep starvation)
+            # is counted by slicing directly -- no expansion, no memory cliff.
+            if width[start] > OVERTAKE_PAIR_BUDGET:
+                cand_u = u_s[lo[start]:start]
+                cand_t = t_s[lo[start]:start]
+                hit = (cand_u > u_s[start]) & (cand_t != t_s[start])
+                intervening[start] = int(np.count_nonzero(hit))
+                ambiguous[start] = int(np.count_nonzero(
+                    (cand_u[hit] - u_s[start]) <= gap_limit))
+                start += 1
+                continue
 
-                    # 3. Check who it overtook O(t)
-                    # Iterate through the remaining pending threads (max size = t - 1)
-                    for other_inv_time, other_idx in pending_invocations.values():
+            consumed = int(widths_cumulative[start - 1]) if start else 0
+            end = int(np.searchsorted(widths_cumulative,
+                                      consumed + OVERTAKE_PAIR_BUDGET,
+                                      side='right'))
+            end = min(max(end, start + 1), n)
 
-                        # If the acquiring thread invoked AFTER the pending thread,
-                        # it means the pending thread was overtaken.
-                        if acq_inv_time > other_inv_time:
-                            results[other_idx][2] += 1
-                            # ...but a gap under the calibration noise floor means
-                            # we can't actually tell who invoked first.
-                            if acq_inv_time - other_inv_time <= AMBIGUITY_CYCLES:
-                                results[other_idx][3] += 1
+            w = width[start:end]
+            total = int(w.sum())
+            if total == 0:
+                start = end
+                continue
 
-        # 4. Rebuild the final dataframe in one shot
-        final_ops = pd.DataFrame(results, columns=['invocation_time', 'thread_id',
-                                                   'intervening_acquisitions',
-                                                   'ambiguous_acquisitions'])
+            # Ragged expansion: op k contributes w[k] consecutive candidate
+            # indices beginning at lo[k].
+            run_starts = np.cumsum(w) - w
+            query = np.repeat(idx[start:end], w)
+            cand = np.arange(total, dtype=np.int64) + np.repeat(lo[start:end] - run_starts, w)
 
-        return final_ops
+            # repeat on the values beats a gather through `query`.
+            u_q = np.repeat(u_s[start:end], w)
+            t_q = np.repeat(t_s[start:end], w)
+            u_cand = u_s[cand]
+            hit = (u_cand > u_q) & (t_s[cand] != t_q)
+
+            local = query[hit] - start
+            span = end - start
+            intervening[start:end] += np.bincount(local, minlength=span)
+            # Subtracting only under the mask keeps this uint64 subtraction from
+            # wrapping -- every surviving pair has u_cand > u_query.
+            gap = u_cand[hit] - u_q[hit]
+            ambiguous[start:end] += np.bincount(local[gap <= gap_limit],
+                                                minlength=span)
+
+            start = end
+
+        # Emitted in invocation order, matching the order the per-event scan
+        # appended rows (it created one per INVOCATION event of the sorted
+        # timeline). Downstream metrics are order-independent, but the cached
+        # overtake parquet is read back as-is.
+        inv_order = np.argsort(u_s, kind='stable')
+        return pd.DataFrame({
+            'invocation_time': u_s[inv_order],
+            'thread_id': t_s[inv_order],
+            'intervening_acquisitions': intervening[inv_order],
+            'ambiguous_acquisitions': ambiguous[inv_order],
+        })
 
     def print_overtake(self, file_path: Path) -> None:
         """
