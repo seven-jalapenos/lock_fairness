@@ -6,6 +6,30 @@ from analysis.metric_averager import MetricAverager, RECOMPUTABLE_SCALARS
 from analysis.stats_exporter import StatsExporter
 
 
+def _report_empty_selection(files_dir: Path, only: set[str] | None,
+                            present: list[str]) -> None:
+    """Explain an empty run-directory selection instead of returning in silence.
+
+    Both entry points used to just return, which is indistinguishable from
+    having run and found nothing to change -- the failure looks like the metric
+    silently not being computed.
+    """
+    if not files_dir.exists():
+        print(f"NOTHING TO DO: {files_dir} does not exist. Pass --csv-dir if the "
+              "run directory tree lives somewhere else (a sweep run with "
+              "--out-dir writes there, not to files/csv).", flush=True)
+        return
+    if only is not None and present:
+        print(f"NOTHING TO DO: none of --only {sorted(only)} matched a directory "
+              f"under {files_dir}. Present: {sorted(present)[:10]}"
+              f"{' ...' if len(present) > 10 else ''}", flush=True)
+        return
+    print(f"NOTHING TO DO: no run directories under {files_dir}. Expected "
+          "subdirectories named <lock>_<threads>_<pin>_w<work>, each holding "
+          "data/*_data.parquet. Pass --csv-dir if your tree is elsewhere.",
+          flush=True)
+
+
 def average_all_metrics(files_dir: Path, only: set[str] | None = None) -> None:
     """
     Averages all metrics across all runs and exports them to CSV.
@@ -20,11 +44,14 @@ def average_all_metrics(files_dir: Path, only: set[str] | None = None) -> None:
     keep it from interleaving, which made a slow directory indistinguishable
     from a stuck one.
     """
+    present = [d.name for d in sorted(files_dir.glob("*")) if d.is_dir()] \
+        if files_dir.exists() else []
     run_dirs = [
-        d for d in sorted(files_dir.glob("*"))
-        if d.is_dir() and (only is None or d.name in only)
+        files_dir / name for name in present
+        if only is None or name in only
     ]
     if not run_dirs:
+        _report_empty_selection(files_dir, only, present)
         return
 
     failures: list[str] = []
@@ -68,20 +95,27 @@ def update_all_metrics(files_dir: Path, names: Optional[Iterable[str]] = None,
     shouldn't pay any of that, so this walks the same directories but computes
     only what was asked for and merges rather than rewrites.
     """
+    present = [d.name for d in sorted(files_dir.glob("*")) if d.is_dir()] \
+        if files_dir.exists() else []
     run_dirs = [
-        d for d in sorted(files_dir.glob("*"))
-        if d.is_dir() and (only is None or d.name in only)
+        files_dir / name for name in present
+        if only is None or name in only
     ]
     if not run_dirs:
+        _report_empty_selection(files_dir, only, present)
         return
 
     failures: list[str] = []
+    written = 0
 
     for index, run_dir in enumerate(run_dirs, start=1):
         print(f"[{index}/{len(run_dirs)}] {run_dir.name}", flush=True)
         try:
             updates = MetricAverager(run_dir).recompute_scalars(names)
             StatsExporter(run_dir).update_scalars(updates)
+            written += 1
+            print(f"    {', '.join(f'{k}={v.avg}' for k, v in updates.items())}",
+                  flush=True)
         except Exception as e:  # noqa: BLE001 - keep going, then fail loudly below
             print(f"[{index}/{len(run_dirs)}] FAILED {run_dir.name}: {e!r}",
                   flush=True)
@@ -98,6 +132,8 @@ def update_all_metrics(files_dir: Path, names: Optional[Iterable[str]] = None,
             f"{len(failures)} of {len(run_dirs)} run directories failed to update; "
             "the rest were written. See the list above."
         )
+
+    print(f"updated {written} run director(ies) under {files_dir}", flush=True)
 
 
 def build_parser() -> argparse.ArgumentParser:
