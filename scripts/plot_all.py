@@ -21,6 +21,10 @@ CROSS_RUN_METRICS = [
     'overtake_depth_p99_normalized',
     'self_transfer_rate',
     f'windowed_jain_{WINDOW_LABELS[10**6]}',
+    # The 1e6 window holds fewer acquisitions than threads once a lock's
+    # throughput collapses, which floors Jain at 1/n regardless of fairness;
+    # 1e7 keeps the per-window sample count meaningful in that regime.
+    f'windowed_jain_{WINDOW_LABELS[10**7]}',
     'total_CS_completions',
 ]
 
