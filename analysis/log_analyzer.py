@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Dict, Tuple, Optional
 
 from .defs import INVOCATION, ACQUISITION
+from .log_parser import create_global_timeline
 
 # Two invocations closer together than the residual cross-core TSC skew can't be
 # reliably ordered, so an "overtake" that hinges on a gap this small is
@@ -28,6 +29,17 @@ WINDOW_SIZES_CYCLES = (10**5, 10**6, 10**7)
 # Suffixes used to name the per-window scalars in the exported CSV.
 WINDOW_LABELS = {10**5: '1e5', 10**6: '1e6', 10**7: '1e7'}
 
+# Window sizes for the fixed-*count* fairness metric, as a multiple of the thread
+# count. A time window stops measuring fairness once a lock's throughput
+# collapses -- it then holds fewer acquisitions than there are threads, which
+# floors Jain at m/n whatever the lock did. Sizing the window in acquisitions
+# instead keeps the sample depth (here 10 per thread) constant at every thread
+# count and every throughput, so the number means the same thing across a sweep.
+WINDOW_COUNT_MULTIPLIERS = (10,)
+
+# Suffixes naming the per-multiplier scalars: k10n is "k = 10 * num_threads".
+WINDOW_COUNT_LABELS = {10: 'k10n'}
+
 # log_coverage is never exactly 1.0 on a healthy run: threads are started and
 # joined in sequence, so the last thread's first invocation trails the first
 # thread's, and the same staggering happens at the end. That costs a fraction of
@@ -38,15 +50,37 @@ COVERAGE_WARN_THRESHOLD = 0.99
 
 class LogAnalyzer:
 
-    def __init__(self, data: pd.DataFrame, global_timeline: pd.DataFrame,
+    def __init__(self, data: pd.DataFrame,
+                 global_timeline: Optional[pd.DataFrame] = None,
                  overtake_timeline: Optional[pd.DataFrame] = None,
                  num_threads: Optional[int] = None):
         self._data = data
-        self._global_timeline = global_timeline
+        # Both derived frames are built on first use, not here. A caller that
+        # wants one cheap scalar shouldn't pay for the melt or -- far worse --
+        # for the O(N*t) overtake scan, which this used to run unconditionally.
+        self._global_timeline_cache = global_timeline
+        self._overtake_timeline_cache = overtake_timeline
         self.num_threads = self._resolve_num_threads(data, num_threads)
-        self._overtake_timeline = overtake_timeline if overtake_timeline is not None else self.create_overtake_timeline()
         self.operation_count = len(data)
-        self.event_count = len(global_timeline)
+
+    @property
+    def _global_timeline(self) -> pd.DataFrame:
+        if self._global_timeline_cache is None:
+            self._global_timeline_cache = create_global_timeline(self._data)
+        return self._global_timeline_cache
+
+    @property
+    def _overtake_timeline(self) -> pd.DataFrame:
+        if self._overtake_timeline_cache is None:
+            self._overtake_timeline_cache = self.create_overtake_timeline()
+        return self._overtake_timeline_cache
+
+    @property
+    def event_count(self) -> int:
+        """Events in the melted timeline: one invocation, acquisition and release
+        per operation. Derived rather than measured so reading it can't force the
+        timeline into existence."""
+        return 3 * self.operation_count
 
     @staticmethod
     def _resolve_num_threads(data: pd.DataFrame, declared: Optional[int]) -> int:
@@ -72,10 +106,17 @@ class LogAnalyzer:
         # still in per-thread block order, which nothing guarantees.
         return int(data['thread_id'].max()) + 1
 
-    def close(self) -> None:
+    def __enter__(self) -> 'LogAnalyzer':
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        """Release the frames. An analyzer holds a whole run -- roughly 0.5 GB per
+        million critical-section completions -- so the averaging pass scopes each
+        one rather than waiting on the collector."""
         self._data = None
-        self._global_timeline = None
-        self._overtake_timeline = None
+        self._global_timeline_cache = None
+        self._overtake_timeline_cache = None
+        return False
 
     def create_overtake_timeline(self) -> pd.DataFrame:
         """
@@ -213,7 +254,6 @@ class LogAnalyzer:
         """
         Utility function to print out the overtake timeline to parquet.
         """
-        assert(self._overtake_timeline is not None)
         file_path.parent.mkdir(parents=True, exist_ok=True)
         # One row per operation, so this is the same order of magnitude as the
         # run's raw data. It stays a cache -- it saves the O(N*t) rescan on
@@ -265,7 +305,6 @@ class LogAnalyzer:
         timestamps being comparable across cores. A large value here means the
         metric is reading TSC skew, not fairness.
         """
-        assert(self._overtake_timeline is not None)
         if self._overtake_timeline.empty:
             return float('nan')
         if 'ambiguous_acquisitions' not in self._overtake_timeline.columns:
@@ -392,7 +431,6 @@ class LogAnalyzer:
         the fraction of concurrent waiters bypassed, which is comparable across
         the thread sweep.
         """
-        assert(self._overtake_timeline is not None)
         keys = ('overtake_depth_p99', 'overtake_depth_max',
                 'overtake_depth_p99_normalized', 'overtake_depth_max_normalized')
         if self._overtake_timeline.empty:
@@ -516,7 +554,6 @@ class LogAnalyzer:
         same-thread bursts. Evaluated across several window sizes, this separates
         "fair at every timescale" (ticket) from "fair only in aggregate" (TTAS).
         """
-        assert(self._global_timeline is not None)
         if self._global_timeline.empty or window_cycles <= 0:
             return float('nan')
 
@@ -552,6 +589,51 @@ class LogAnalyzer:
             return float('nan')
 
         counts = counts[active]
+        sq = (counts ** 2).sum(axis=1)
+        per_window = (counts.sum(axis=1) ** 2) / (counts.shape[1] * sq)
+        return float(np.mean(per_window))
+
+    def windowed_jain_by_count(self, multiplier: int) -> float:
+        """
+        Mean Jain index of per-thread acquisition counts within windows of a
+        fixed number of acquisitions, k = multiplier * num_threads.
+
+        windowed_jain() bins by wall time, which stops measuring fairness once a
+        lock's throughput collapses: a window then holds fewer acquisitions than
+        there are threads, and Jain over a mostly-zero vector is pinned near m/n
+        no matter how the lock behaved. Binning by acquisition count instead puts
+        exactly k events in every window, so the index reflects how those k were
+        shared rather than how many there were -- comparable across thread counts
+        and across a throughput cliff.
+        """
+        assert(self._data is not None)
+        if self._data.empty or multiplier <= 0 or self.num_threads <= 0:
+            return float('nan')
+
+        # The acquisition-ordered thread sequence. Taken from the flat frame
+        # rather than the melted timeline: the lock totally orders acquisitions
+        # so the two are identical, but this sorts N rows instead of melting 3N,
+        # and it leaves this metric computable without a timeline at all.
+        ordered = self._data[['acquisition', 'thread_id']].sort_values(
+            'acquisition', kind='stable')
+        tid = ordered['thread_id'].to_numpy().astype(np.int64)
+
+        k = int(multiplier) * int(self.num_threads)
+        n_windows = tid.size // k
+        # Unlike a short final time window, a group of fewer than k acquisitions
+        # isn't a smaller window -- under this definition it isn't one at all.
+        if n_windows == 0:
+            return float('nan')
+
+        usable = n_windows * k
+        tid = tid[:usable]
+        bins = np.arange(usable, dtype=np.int64) // k
+
+        counts = np.zeros((n_windows, int(self.num_threads)), dtype=np.float64)
+        np.add.at(counts, (bins, tid), 1.0)
+
+        # No `active` filter here: every window holds exactly k > 0 acquisitions
+        # by construction, which is the whole point of sizing windows this way.
         sq = (counts ** 2).sum(axis=1)
         per_window = (counts.sum(axis=1) ** 2) / (counts.shape[1] * sq)
         return float(np.mean(per_window))

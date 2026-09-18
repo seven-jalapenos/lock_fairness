@@ -1,13 +1,14 @@
 from .data_importer import import_parquet
 from .log_parser import create_global_timeline
 from .log_analyzer import (LogAnalyzer, COVERAGE_WARN_THRESHOLD,
-                           WINDOW_SIZES_CYCLES, WINDOW_LABELS)
+                           WINDOW_SIZES_CYCLES, WINDOW_LABELS,
+                           WINDOW_COUNT_MULTIPLIERS, WINDOW_COUNT_LABELS)
 from .defs import Stats, parse_run_dir_id
 
 from pathlib import Path
 import pandas as pd
 import numpy as np
-from typing import Dict, Any
+from typing import Callable, Dict, Any, Iterable, List, Optional
 
 data_dir = 'data'
 
@@ -28,7 +29,16 @@ SIMPLE_SCALARS = [
     'wait_p50', 'wait_p90', 'wait_p99', 'wait_p999', 'wait_max',
     'overtake_depth_p99', 'overtake_depth_max',
     'overtake_depth_p99_normalized', 'overtake_depth_max_normalized',
-] + [f'windowed_jain_{WINDOW_LABELS[w]}' for w in WINDOW_SIZES_CYCLES]
+] + [f'windowed_jain_{WINDOW_LABELS[w]}' for w in WINDOW_SIZES_CYCLES] \
+  + [f'windowed_jain_{WINDOW_COUNT_LABELS[m]}' for m in WINDOW_COUNT_MULTIPLIERS]
+
+# Scalars derivable from data/*_data.parquet alone -- no melted timeline, no
+# overtake scan. These are the ones worth recomputing on their own against an
+# already-analyzed tree, which is what MetricAverager.recompute_scalars does.
+RECOMPUTABLE_SCALARS: Dict[str, Callable[[LogAnalyzer], float]] = {
+    f'windowed_jain_{WINDOW_COUNT_LABELS[m]}': (lambda la, m=m: la.windowed_jain_by_count(m))
+    for m in WINDOW_COUNT_MULTIPLIERS
+}
 
 
 class MetricAverager:
@@ -64,6 +74,46 @@ class MetricAverager:
             self.data_dir
         )
         return self
+
+    def recompute_scalars(self, names: Optional[Iterable[str]] = None) -> Dict[str, Any]:
+        """Compute just the named RECOMPUTABLE_SCALARS for this run directory.
+
+        The full pass rebuilds the global timeline and loads or re-runs the
+        O(N*t) overtake scan for every rep, which for a short critical section is
+        the heaviest phase of a sweep. These metrics need neither, so adding one
+        to an already-analyzed tree shouldn't cost a re-analysis -- it reads the
+        per-rep parquet and nothing else.
+        """
+        table = RECOMPUTABLE_SCALARS
+        if names is not None:
+            wanted = list(names)
+            unknown = sorted(set(wanted) - set(table))
+            if unknown:
+                raise ValueError(
+                    f"unknown recomputable metric(s): {unknown}. "
+                    f"known: {sorted(table)}")
+            table = {name: table[name] for name in wanted}
+
+        per_rep: Dict[str, List[float]] = {name: [] for name in table}
+        data_files = sorted(self.data_dir.glob('*_data.parquet'))
+        if not data_files:
+            raise FileNotFoundError(f"no *_data.parquet under {self.data_dir}")
+
+        for data_file in data_files:
+            data = import_parquet(data_file)
+            # import_parquet swallows a read error and hands back an empty frame.
+            # On the full pass that surfaces immediately; here it would quietly
+            # average to nan and overwrite a good value in the summary CSV, so
+            # refuse rather than merge a value built on nothing.
+            if data.empty:
+                raise ValueError(f"{data_file} read as empty -- refusing to "
+                                 "overwrite existing metrics with nan")
+            with LogAnalyzer(data, num_threads=self.declared_threads) as analyzer:
+                for name, fn in table.items():
+                    per_rep[name].append(fn(analyzer))
+
+        return {name: self.simple_stats(np.asarray(vals, dtype=np.float64))
+                for name, vals in per_rep.items()}
 
     def make_analyzer(self, data_file: Path, overtake_file: Path) -> LogAnalyzer:
         data = import_parquet(data_file)
@@ -110,71 +160,72 @@ class MetricAverager:
         for run, data_file in enumerate(data_files):
             stem = data_file.name[:-len('_data.parquet')]
             overtake_file = self.run_dir / 'overtake' / f'{stem}_timeline.parquet'
-            analyzer = self.make_analyzer(data_file, overtake_file)
-            if not threads:
-                threads = analyzer.num_threads
+            with self.make_analyzer(data_file, overtake_file) as analyzer:
+                if not threads:
+                    threads = analyzer.num_threads
 
-            # 1. Fetch values
-            avg_wait, var_wait, count_wait = analyzer.find_avg_per_thread_wait_time()
-            avg_overtake, var_overtake = analyzer.overtake_percentage()
-            avg_depth, var_depth = analyzer.average_overtake_depth()
-            transfer = analyzer.lock_transfer_matrix()
-            coverage = analyzer.log_coverage()
+                # 1. Fetch values
+                avg_wait, var_wait, count_wait = analyzer.find_avg_per_thread_wait_time()
+                avg_overtake, var_overtake = analyzer.overtake_percentage()
+                avg_depth, var_depth = analyzer.average_overtake_depth()
+                transfer = analyzer.lock_transfer_matrix()
+                coverage = analyzer.log_coverage()
 
-            # A truncated run understates unfairness rather than merely losing
-            # samples: the threads a lock favors fill their buffers first and go
-            # dark, so the survivors look more equal than they were. Flag it here,
-            # where the run it belongs to is still named.
-            if np.isfinite(coverage) and coverage < COVERAGE_WARN_THRESHOLD:
-                print(
-                    f"  WARNING: {self.run_dir.name} iteration {run} has "
-                    f"log_coverage={coverage:.4f} "
-                    f"(<{COVERAGE_WARN_THRESHOLD}) -- the log truncated and "
-                    "every count-based metric from it is biased. Raise "
-                    "LOG_BUDGET_BYTES or shorten DURATION and re-run.",
-                    flush=True
-                )
+                # A truncated run understates unfairness rather than merely losing
+                # samples: the threads a lock favors fill their buffers first and go
+                # dark, so the survivors look more equal than they were. Flag it here,
+                # where the run it belongs to is still named.
+                if np.isfinite(coverage) and coverage < COVERAGE_WARN_THRESHOLD:
+                    print(
+                        f"  WARNING: {self.run_dir.name} iteration {run} has "
+                        f"log_coverage={coverage:.4f} "
+                        f"(<{COVERAGE_WARN_THRESHOLD}) -- the log truncated and "
+                        "every count-based metric from it is biased. Raise "
+                        "LOG_BUDGET_BYTES or shorten DURATION and re-run.",
+                        flush=True
+                    )
 
-            denom = max(1, int(analyzer.num_threads) - 1)
+                denom = max(1, int(analyzer.num_threads) - 1)
 
-            record = {
-                'run': run,
-                'operation_count': analyzer.operation_count,
-                'per_thread_wait_time': avg_wait,
-                'per_thread_wait_count': count_wait,
-                'per_thread_throughput': analyzer.per_thread_throughput(),
-                'overtake_percentage': avg_overtake,
-                'average_overtake_depth': avg_depth,
-                'average_overtake_depth_normalized': avg_depth / denom,
-                'total_CS_completions': analyzer.total_CS_completions(),
-                'lock_transfer_matrix': transfer,
-                'throughput_ops_per_Mcycle': analyzer.throughput_ops_per_Mcycle(),
-                'throughput_jain_index': analyzer.throughput_jain_index(),
-                'throughput_ratio': analyzer.throughput_ratio(),
-                'wait_time_cov': analyzer.wait_time_cov(),
-                'mean_hold_time': analyzer.mean_hold_time(),
-                'log_coverage': coverage,
-                'ordering_ambiguity_fraction': analyzer.ordering_ambiguity_fraction(),
-                'self_transfer_rate': analyzer.self_transfer_rate(transfer),
-                'transfer_entropy': analyzer.transfer_entropy(transfer),
-            }
-            record.update(analyzer.wait_time_percentiles())
-            record.update(analyzer.overtake_depth_percentiles())
-            for window in WINDOW_SIZES_CYCLES:
-                record[f'windowed_jain_{WINDOW_LABELS[window]}'] = analyzer.windowed_jain(window)
+                record = {
+                    'run': run,
+                    'operation_count': analyzer.operation_count,
+                    'per_thread_wait_time': avg_wait,
+                    'per_thread_wait_count': count_wait,
+                    'per_thread_throughput': analyzer.per_thread_throughput(),
+                    'overtake_percentage': avg_overtake,
+                    'average_overtake_depth': avg_depth,
+                    'average_overtake_depth_normalized': avg_depth / denom,
+                    'total_CS_completions': analyzer.total_CS_completions(),
+                    'lock_transfer_matrix': transfer,
+                    'throughput_ops_per_Mcycle': analyzer.throughput_ops_per_Mcycle(),
+                    'throughput_jain_index': analyzer.throughput_jain_index(),
+                    'throughput_ratio': analyzer.throughput_ratio(),
+                    'wait_time_cov': analyzer.wait_time_cov(),
+                    'mean_hold_time': analyzer.mean_hold_time(),
+                    'log_coverage': coverage,
+                    'ordering_ambiguity_fraction': analyzer.ordering_ambiguity_fraction(),
+                    'self_transfer_rate': analyzer.self_transfer_rate(transfer),
+                    'transfer_entropy': analyzer.transfer_entropy(transfer),
+                }
+                record.update(analyzer.wait_time_percentiles())
+                record.update(analyzer.overtake_depth_percentiles())
+                for window in WINDOW_SIZES_CYCLES:
+                    record[f'windowed_jain_{WINDOW_LABELS[window]}'] = analyzer.windowed_jain(window)
+                for mult in WINDOW_COUNT_MULTIPLIERS:
+                    record[f'windowed_jain_{WINDOW_COUNT_LABELS[mult]}'] = \
+                        analyzer.windowed_jain_by_count(mult)
 
-            # 2. Store run metrics in a dictionary (much safer for arrays than 1-row DataFrames)
-            run_records.append(record)
+                # 2. Store run metrics in a dictionary (much safer for arrays than 1-row DataFrames)
+                run_records.append(record)
 
-            # 3. Store variance metrics
-            var_records.append({
-                'run': run,
-                'per_thread_wait_time': var_wait,
-                'overtake_percentage': var_overtake,
-                'average_overtake_depth': var_depth,
-            })
-
-            analyzer.close()
+                # 3. Store variance metrics
+                var_records.append({
+                    'run': run,
+                    'per_thread_wait_time': var_wait,
+                    'overtake_percentage': var_overtake,
+                    'average_overtake_depth': var_depth,
+                })
 
         # Convert list of dicts to DataFrame in one shot
         return pd.DataFrame(run_records), pd.DataFrame(var_records), threads

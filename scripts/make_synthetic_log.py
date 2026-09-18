@@ -549,6 +549,7 @@ def check_end_to_end(c: Checker) -> None:
         'wait_p50', 'wait_p99', 'wait_max',
         'overtake_depth_p99_normalized', 'average_overtake_depth_normalized',
         'windowed_jain_1e5', 'windowed_jain_1e6', 'windowed_jain_1e7',
+        'windowed_jain_k10n',
         'overtake_percentage', 'average_wait_time', 'total_CS_completions',
     ]
     missing = [m for m in required if m not in text]
@@ -573,6 +574,121 @@ def check_end_to_end(c: Checker) -> None:
             any('windowed_jain_by_window' in name for name in pngs))
 
 
+def check_windowed_jain_by_count(c: Checker) -> None:
+    """Fixed-count windows on fixtures whose per-window split is known exactly."""
+    print("\nfixture: fixed-count windowed Jain")
+
+    # 2000 acquisitions, k = 10*4 = 40, so 50 whole windows each holding exactly
+    # ten operations per thread.
+    a = analyzer_for(fair_rotation(4, 500), pin=1, tag='count_fair')
+    c.close_to("windowed_jain_by_count(10): strict rotation -> 1.0",
+               a.windowed_jain_by_count(10), 1.0)
+
+    # 1600 acquisitions of a repeating (0,0,0,1), k = 20. The exactness here is a
+    # coincidence worth not generalizing: k is a whole multiple of the fixture's
+    # period-4 interleave, so every window sees the same 15:5 split and the mean
+    # of per-window Jain equals the aggregate. Jain is concave, so for a k that
+    # straddled the period this would need a tolerance instead.
+    b = analyzer_for(starved_pair(400), pin=1, tag='count_starved')
+    c.close_to("windowed_jain_by_count(10): 3:1 split -> 0.8",
+               b.windowed_jain_by_count(10), 0.8)
+
+    # Three threads rotating with a fourth silent, k = 40. 40 = 3*13 + 1, so
+    # every window is (14,13,13,0) and the value is 1600/2136 -- just under the
+    # 0.75 the aggregate index reports, because a window can't split 40 three
+    # ways evenly.
+    d = analyzer_for(silent_thread(4, 400), pin=1, tag='count_silent')
+    c.close_to("windowed_jain_by_count(10): one silent of four -> 1600/2136",
+               d.windowed_jain_by_count(10), 1600 / 2136)
+
+    # Fewer acquisitions than one window holds. A short group isn't a smaller
+    # window under this definition, so there is nothing to report.
+    tiny = analyzer_for(fair_rotation(4, 1), pin=1, tag='count_tiny')
+    wj = tiny.windowed_jain_by_count(10)
+    c.check("windowed_jain_by_count(10) is nan below one full window",
+            math.isnan(wj), f"(got {wj})")
+
+
+def check_acquisition_sequence_equivalence(c: Checker) -> None:
+    """windowed_jain_by_count reads the flat frame while windowed_jain reads the
+    melted timeline; they must see the same acquisition order."""
+    print("\nacquisition order: flat frame vs melted timeline")
+    from analysis.defs import ACQUISITION
+
+    a = analyzer_for(random_contention(8, 1500, seed=3), pin=1, tag='count_equiv')
+    from_data = (a._data.sort_values('acquisition', kind='stable')['thread_id']
+                 .to_numpy())
+    timeline = a._global_timeline
+    from_timeline = (timeline[timeline['event_type'] == ACQUISITION]
+                     .sort_values('timestamp', kind='stable')['thread_id']
+                     .to_numpy())
+    c.check("same acquisition-ordered thread sequence either way",
+            np.array_equal(from_data, from_timeline),
+            f"(lengths {from_data.size} vs {from_timeline.size})")
+
+
+def check_scalar_merge(c: Checker) -> None:
+    """A metric-only recompute must merge into the summary CSV, not rewrite it.
+
+    export() takes whatever dict it is handed and truncates the file, so the
+    partial path writing through it would silently drop every other scalar the
+    full pass produced. That is the one new way this can lose data."""
+    print("\nend to end: partial recompute merges without clobbering")
+    import csv as csv_module
+    from scripts.all_metrics import average_all_metrics, update_all_metrics
+
+    csv_root = OUT_ROOT / 'pqt_merge'
+    if csv_root.exists():
+        shutil.rmtree(csv_root)
+
+    run_dir = csv_root / 'mcs_4_1_w1000'
+    for rep in range(2):
+        a = analyzer_for(fair_rotation(4, 300), pin=1, tag=f'merge_{rep}')
+        exporter = DataExporter(a._data, a._global_timeline, str(run_dir), str(rep))
+        exporter.write_raw()
+        exporter.close()
+
+    average_all_metrics(csv_root)
+
+    summary = run_dir / 'summary_scalar_metrics.csv'
+
+    def read_rows():
+        with open(summary, newline='') as f:
+            rows = list(csv_module.reader(f))
+        return {r[0]: (r[1], r[2]) for r in rows[1:]}
+
+    before = read_rows()
+    c.check("full pass writes windowed_jain_k10n too",
+            'windowed_jain_k10n' in before)
+
+    update_all_metrics(csv_root, names=['windowed_jain_k10n'])
+    after = read_rows()
+
+    changed = [k for k in before
+               if k != 'windowed_jain_k10n' and before[k] != after.get(k)]
+    c.check("every other metric survives the partial update unchanged",
+            not changed, f"(changed: {changed})")
+    c.check("no rows dropped or duplicated",
+            len(before) == len(after), f"(before {len(before)}, after {len(after)})")
+    c.check("windowed_jain_k10n still present after the update",
+            'windowed_jain_k10n' in after)
+    c.check("atomic write leaves no temp file behind",
+            not list(run_dir.glob('.summary_scalar_metrics.csv.tmp*')))
+
+    # A fair rotation scores 1.0 whichever path computed it, so the merged value
+    # must match what the full pass wrote rather than merely being present.
+    c.close_to("merged value matches the full pass",
+               float(after['windowed_jain_k10n'][0]),
+               float(before['windowed_jain_k10n'][0]))
+
+    try:
+        MetricAverager(run_dir).recompute_scalars(['no_such_metric'])
+    except ValueError:
+        c.check("unknown metric name rejected", True)
+    else:
+        c.check("unknown metric name rejected", False, "(no ValueError)")
+
+
 def main() -> int:
     c = Checker()
     if OUT_ROOT.exists():
@@ -585,12 +701,15 @@ def main() -> int:
     check_fair_rotation(c)
     check_starvation(c)
     check_silent_thread(c)
+    check_windowed_jain_by_count(c)
+    check_acquisition_sequence_equivalence(c)
     check_overtakes(c)
     check_overtake_equivalence(c)
     check_truncation(c)
     check_calibration(c)
     check_offsets_parsing(c)
     check_end_to_end(c)
+    check_scalar_merge(c)
     check_ragged_reps(c)
 
     print(f"\n{c.checks - len(c.failures)}/{c.checks} checks passed")

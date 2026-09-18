@@ -1,5 +1,6 @@
 
 import csv
+import os
 from pathlib import Path
 from typing import Dict, Any, List
 from .defs import Stats
@@ -45,6 +46,43 @@ class StatsExporter:
                 writer.writerow([name, stats.avg, stats.std])
         
         # print(f"Exported scalar metrics to: {filepath}")
+
+    def update_scalars(self, updates: Dict[str, Stats]) -> None:
+        """Merge `updates` into summary_scalar_metrics.csv, keeping everything else.
+
+        export() rewrites the file from whatever dict it is handed, so using it to
+        write a single recomputed metric would erase every other scalar the full
+        averaging pass produced. This reads what is there, overlays the new
+        values, and replaces the file atomically -- a run that dies mid-write
+        leaves the previous summary intact rather than a truncated one.
+        """
+        filepath = self.output_dir / "summary_scalar_metrics.csv"
+
+        merged: Dict[str, Stats] = {}
+        if filepath.exists():
+            with open(filepath, newline='', encoding='utf-8') as f:
+                reader = csv.reader(f)
+                next(reader, None)  # header
+                for row in reader:
+                    if len(row) >= 3:
+                        # Kept as text, not parsed: rows this call isn't updating
+                        # should come back out byte-for-byte as they went in.
+                        merged[row[0]] = Stats(avg=row[1], std=row[2])
+
+        # Existing rows keep their position; new ones append in insertion order.
+        merged.update(updates)
+
+        tmp_path = filepath.with_name(f".{filepath.name}.tmp{os.getpid()}")
+        try:
+            with open(tmp_path, mode='w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(['Metric', 'Average', 'Standard_Deviation'])
+                for name, stats in merged.items():
+                    writer.writerow([name, stats.avg, stats.std])
+            os.replace(tmp_path, filepath)
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
 
     def _export_1d_array(self, metric_name: str, stats_list: List[Stats]) -> None:
         """Writes 1D thread-level array data (e.g., per_thread_wait_time) to a CSV."""

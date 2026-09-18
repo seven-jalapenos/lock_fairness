@@ -1,8 +1,10 @@
 
 
+import argparse
 from pathlib import Path
 
-from analysis.log_analyzer import WINDOW_SIZES_CYCLES, WINDOW_LABELS
+from analysis.log_analyzer import (WINDOW_SIZES_CYCLES, WINDOW_LABELS,
+                                   WINDOW_COUNT_LABELS)
 from analysis.single_run_plotter import SingleRunPlotter
 from analysis.cross_run_plotter import CrossRunPlotter
 
@@ -25,6 +27,10 @@ CROSS_RUN_METRICS = [
     # throughput collapses, which floors Jain at 1/n regardless of fairness;
     # 1e7 keeps the per-window sample count meaningful in that regime.
     f'windowed_jain_{WINDOW_LABELS[10**7]}',
+    # Fixed-count companion to the two above. Both of those bin by wall time, so
+    # once a lock collapses they hold fewer acquisitions than threads and report
+    # sample count rather than fairness; this one holds k=10*threads either way.
+    f'windowed_jain_{WINDOW_COUNT_LABELS[10]}',
     'total_CS_completions',
 ]
 
@@ -97,8 +103,30 @@ def plot_cross_runs(runs_csv_dir: Path, figures_dir: Path) -> None:
             plotter.plot_timescale(where=where, name_suffix=suffix)
 
 
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog='python -m scripts.plot_all',
+        description='Render single-run and cross-run figures from the CSV tree.')
+    parser.add_argument('--csv-dir', type=Path, default=Path('files/csv'),
+                        help='root of the run directory tree (default files/csv)')
+    parser.add_argument('--figures-dir', type=Path,
+                        default=Path('files/final_figures'),
+                        help='where cross-run figures are written')
+    # Recomputing one scalar and redrawing the comparison figures shouldn't also
+    # regenerate every per-run figure in the tree -- that is one directory of
+    # plotting work per run in the whole sweep.
+    parser.add_argument('--cross-only', action='store_true',
+                        help='skip the per-run figures, draw only the cross-run '
+                             'comparisons')
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = build_parser().parse_args(argv)
+    if not args.cross_only:
+        plot_single_runs(args.csv_dir)
+    plot_cross_runs(args.csv_dir, args.figures_dir)
+
+
 if __name__ == '__main__':
-    runs_csv_dir = Path("files/csv")
-    figures_dir = Path("files/final_figures")
-    plot_single_runs(runs_csv_dir)
-    plot_cross_runs(runs_csv_dir, figures_dir)
+    main()
