@@ -21,6 +21,12 @@ CROSS_RUN_METRICS = [
     'wait_max',
     'overtake_percentage',
     'overtake_depth_p99_normalized',
+    # The tail says how bad the worst starvation gets; the mean says how much
+    # inversion the lock does in total. Times overtake_percentage it is the
+    # normalized inversion rate -- the informative half of a Kendall tau,
+    # without the N^2 denominator that pins the textbook one at ~0.999999 for
+    # every lock. Normalized rather than raw so it survives the thread sweep.
+    'average_overtake_depth_normalized',
     'self_transfer_rate',
     f'windowed_jain_{WINDOW_LABELS[10**6]}',
     # The 1e6 window holds fewer acquisitions than threads once a lock's
