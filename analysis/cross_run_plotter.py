@@ -65,7 +65,7 @@ class CrossRunPlotter:
     def _default_param_parser(self, folder_name: str) -> Dict[str, Any]:
         """
         Parses run folder names like `mcs_8_1_w10000` (or legacy `mcs_8_1`) into
-        'lock_type', 'threads', 'pin' and 'work'. Modify this if your naming differs.
+        'lock_type', 'threads', 'pin', 'work' and 'ncs'. Modify this if your naming differs.
 
         Delegates to defs.parse_run_dir_id so the directory naming has exactly one
         reader; MetricAverager reads the same name for its thread count, and two
@@ -79,6 +79,7 @@ class CrossRunPlotter:
             'threads': params['threads'],
             'pin': params['pin'],
             'work': params['work'],
+            'ncs': params['ncs'],
         }
 
     def plot_metric(self, metric_name: str, x_axis: str, line_axis: Optional[str] = None,

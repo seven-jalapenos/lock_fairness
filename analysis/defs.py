@@ -20,7 +20,7 @@ EVENT_CODES = {
     'release': RELEASE,
 }
 
-# Run directories are named <lock>_<threads>_<pin>_w<work>, written by
+# Run directories are named <lock>_<threads>_<pin>_w<work>[_n<ncs>], written by
 # scripts/runner.py:run_dir_id(). This is the single reader of that name.
 # The thread count it carries is the only authoritative record of how many
 # threads a run spawned: a thread that completed no operations leaves no rows
@@ -30,14 +30,16 @@ EVENT_CODES = {
 # Anchored, because an unanchored match would accept the `<lock>_<threads>_<pin>`
 # prefix of a work-suffixed directory and silently collapse every work size onto
 # one line. The work group is optional so directories from sweeps predating the
-# work dimension still parse.
+# work dimension still parse. The ncs group is absent for ncs=0, which every run
+# before the NCS dimension implicitly was.
 RUN_DIR_PATTERN = re.compile(
-    r'^(?P<lock>[A-Za-z]+)_(?P<threads>\d+)_(?P<pin>\d+)(?:_w(?P<work>\d+))?$'
+    r'^(?P<lock>[A-Za-z]+)_(?P<threads>\d+)_(?P<pin>\d+)'
+    r'(?:_w(?P<work>\d+)(?:_n(?P<ncs>\d+))?)?$'
 )
 
 
 def parse_run_dir_id(folder_name: str) -> dict | None:
-    """Parse `mcs_8_1_w10000` (or legacy `mcs_8_1`) into its parameters.
+    """Parse `mcs_8_1_w10000_n5000` (or `mcs_8_1_w10000`, legacy `mcs_8_1`) into its parameters.
 
     Returns None when the name doesn't match, so callers can fall back instead
     of crashing on a hand-made or legacy directory."""
@@ -45,9 +47,11 @@ def parse_run_dir_id(folder_name: str) -> dict | None:
     if match is None:
         return None
     work = match.group('work')
+    ncs = match.group('ncs')
     return {
         'lock': match.group('lock'),
         'threads': int(match.group('threads')),
         'pin': int(match.group('pin')),
         'work': int(work) if work is not None else None,
+        'ncs': int(ncs) if ncs is not None else 0,
     }

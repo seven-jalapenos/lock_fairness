@@ -26,6 +26,8 @@ from analysis import LogParser, LogAnalyzer, DataExporter, MetricAverager, Stats
 from analysis import create_global_timeline
 from analysis.log_analyzer import AMBIGUITY_CYCLES, COVERAGE_WARN_THRESHOLD
 from analysis.log_parser import core_for_thread
+from analysis.defs import parse_run_dir_id
+from scripts.runner import run_dir_id
 
 # Start well away from zero so anything that accidentally treats a timestamp as
 # a duration shows up as an absurd number rather than a plausible one.
@@ -141,6 +143,62 @@ def silent_thread(num_threads: int, rounds: int) -> list:
     per_thread = fair_rotation(num_threads - 1, rounds)
     per_thread.append([])
     return per_thread
+
+
+def handoff_chain(num_threads: int, rounds: int, hold: int = 10,
+                  handoffs=(50,)) -> list:
+    """FIFO rotation where every thread re-invokes right after its release, so
+    each handoff goes to a thread that was already waiting.
+
+    Handoff i (to the i-th acquisition, i >= 1) takes handoffs[i % len] cycles
+    exactly, so the latency distribution is known by construction. A negative
+    entry models a calibration error: the next acquisition stamped before the
+    previous release."""
+    per_thread = [[] for _ in range(num_threads)]
+    next_inv = [BASE] * num_threads
+    prev_rel = BASE
+    i = 0
+    for _ in range(rounds):
+        for tid in range(num_threads):
+            acq = prev_rel + handoffs[i % len(handoffs)] if i else BASE + 1
+            assert next_inv[tid] < acq, "fixture needs a longer hold"
+            rel = acq + hold
+            per_thread[tid].append((next_inv[tid], acq, rel))
+            next_inv[tid] = rel + 1
+            prev_rel = rel
+            i += 1
+    return per_thread
+
+
+def barging_pair(rounds: int, burst: int = 3, hold: int = 2,
+                 self_gap: int = 5, handoff: int = 50) -> list:
+    """Thread 0 reacquires `burst` times in a row, `self_gap` cycles after each
+    of its own releases, while thread 1 sits pending; the lock then passes to
+    thread 1 and back, `handoff` cycles each way.
+
+    Every self pair has another thread waiting and every cross pair has the next
+    acquirer waiting, so self_handoff_p50 is exactly self_gap and every
+    cross-thread handoff is exactly `handoff`."""
+    a, b = [], []
+    b_inv = BASE
+    a_inv = BASE
+    prev_rel = None
+    for _ in range(rounds):
+        for j in range(burst):
+            if prev_rel is None:
+                acq = BASE + 1
+            else:
+                acq = prev_rel + (handoff if j == 0 else self_gap)
+            rel = acq + hold
+            a.append((a_inv, acq, rel))
+            a_inv = rel + 1
+            prev_rel = rel
+        acq = prev_rel + handoff
+        rel = acq + hold
+        b.append((b_inv, acq, rel))
+        b_inv = rel + 1
+        prev_rel = rel
+    return [a, b]
 
 
 def random_contention(num_threads: int, grants: int, seed: int = 0) -> list:
@@ -265,6 +323,57 @@ def check_pin_mapping(c: Checker) -> None:
             not collisions, f"collisions at: {collisions[:3]}")
     c.check("pin map: policy 0 is reported as unpinned",
             core_for_thread(0, 8, 8, 0) is None)
+
+
+def check_run_dir_naming(c: Checker) -> None:
+    """run_dir_id and parse_run_dir_id must round-trip, and ncs=0 must keep the
+    pre-NCS name so existing trees still resume and plot."""
+    for ncs in (0, 5000):
+        params = {'lock': 'ttas', 'threads': 8, 'pin': 3, 'work': 1000, 'ncs': ncs}
+        c.check(f"dir id: round-trips with ncs={ncs}",
+                parse_run_dir_id(run_dir_id(params)) == params)
+    c.check("dir id: ncs=0 omits the suffix",
+            run_dir_id({'lock': 'mcs', 'threads': 4, 'pin': 1, 'work': 100, 'ncs': 0})
+            == 'mcs_4_1_w100')
+    c.check("dir id: legacy names parse as ncs=0",
+            parse_run_dir_id('mcs_4_1')['ncs'] == 0
+            and parse_run_dir_id('mcs_4_1_w100')['ncs'] == 0)
+    c.check("dir id: ncs without work is rejected",
+            parse_run_dir_id('mcs_4_1_n100') is None)
+
+
+def check_handoff(c: Checker) -> None:
+    """handoff_stats against distributions known by construction."""
+    print("\nhandoff latency")
+    a = analyzer_for(handoff_chain(4, 200, handoffs=(50,)), pin=1, tag='handoff_chain')
+    h = a.handoff_stats()
+    c.close_to("chain: handoff_p50 is the fixed handoff", h['handoff_p50'], 50.0)
+    c.close_to("chain: handoff_p99 is the fixed handoff", h['handoff_p99'], 50.0)
+    c.close_to("chain: no negative handoffs", h['handoff_negative_fraction'], 0.0)
+    c.check("chain: FIFO has no self-handoffs", math.isnan(h['self_handoff_p50']))
+
+    h = analyzer_for(fair_rotation(4, 200), pin=1, tag='handoff_idle').handoff_stats()
+    c.check("uncontended gaps are not handoffs",
+            all(math.isnan(v) for v in h.values()), f"(got {h})")
+
+    h = analyzer_for(handoff_chain(1, 200), pin=1, tag='handoff_single').handoff_stats()
+    c.check("one thread: nobody waiting, so no handoffs",
+            all(math.isnan(v) for v in h.values()), f"(got {h})")
+
+    h = analyzer_for(barging_pair(100, burst=3, self_gap=5, handoff=50),
+                     pin=1, tag='handoff_barge').handoff_stats()
+    c.close_to("barging: self_handoff_p50 is the reacquire gap",
+               h['self_handoff_p50'], 5.0)
+    c.close_to("barging: self pairs kept out of handoff_p50", h['handoff_p50'], 50.0)
+    c.close_to("barging: self pairs kept out of handoff_p99", h['handoff_p99'], 50.0)
+
+    # 2 threads alternating over 2R ops: R of the 2R-1 handoffs land on odd
+    # indices, which get the negative entry.
+    rounds = 100
+    h = analyzer_for(handoff_chain(2, rounds, handoffs=(50, -5)),
+                     pin=1, tag='handoff_skew').handoff_stats()
+    c.close_to("skewed: negative fraction counts impossible handoffs",
+               h['handoff_negative_fraction'], rounds / (2 * rounds - 1))
 
 
 def check_jain_closed_form(c: Checker) -> None:
@@ -643,7 +752,7 @@ def check_scalar_merge(c: Checker) -> None:
 
     run_dir = csv_root / 'mcs_4_1_w1000'
     for rep in range(2):
-        a = analyzer_for(fair_rotation(4, 300), pin=1, tag=f'merge_{rep}')
+        a = analyzer_for(handoff_chain(4, 300), pin=1, tag=f'merge_{rep}')
         exporter = DataExporter(a._data, a._global_timeline, str(run_dir), str(rep))
         exporter.write_raw()
         exporter.close()
@@ -681,6 +790,19 @@ def check_scalar_merge(c: Checker) -> None:
                float(after['windowed_jain_k10n'][0]),
                float(before['windowed_jain_k10n'][0]))
 
+    handoff_names = ['handoff_p50', 'handoff_p99', 'self_handoff_p50',
+                     'handoff_negative_fraction']
+    c.check("full pass writes the handoff scalars",
+            all(n in before for n in handoff_names))
+    update_all_metrics(csv_root, names=handoff_names)
+    after = read_rows()
+    c.check("handoff recompute matches the full pass",
+            all(before.get(n) == after.get(n) for n in handoff_names),
+            f"(before {[before.get(n) for n in handoff_names]}, "
+            f"after {[after.get(n) for n in handoff_names]})")
+    c.close_to("handoff recompute yields the constructed latency",
+               float(after['handoff_p50'][0]), 50.0)
+
     try:
         MetricAverager(run_dir).recompute_scalars(['no_such_metric'])
     except ValueError:
@@ -696,12 +818,14 @@ def main() -> int:
 
     print("pin mapping")
     check_pin_mapping(c)
+    check_run_dir_naming(c)
     print("\njain closed forms")
     check_jain_closed_form(c)
     check_fair_rotation(c)
     check_starvation(c)
     check_silent_thread(c)
     check_windowed_jain_by_count(c)
+    check_handoff(c)
     check_acquisition_sequence_equivalence(c)
     check_overtakes(c)
     check_overtake_equivalence(c)

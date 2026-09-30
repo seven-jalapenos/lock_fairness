@@ -2,7 +2,8 @@ from .data_importer import import_parquet
 from .log_parser import create_global_timeline
 from .log_analyzer import (LogAnalyzer, COVERAGE_WARN_THRESHOLD,
                            WINDOW_SIZES_CYCLES, WINDOW_LABELS,
-                           WINDOW_COUNT_MULTIPLIERS, WINDOW_COUNT_LABELS)
+                           WINDOW_COUNT_MULTIPLIERS, WINDOW_COUNT_LABELS,
+                           HANDOFF_SCALARS)
 from .defs import Stats, parse_run_dir_id
 
 from pathlib import Path
@@ -29,7 +30,7 @@ SIMPLE_SCALARS = [
     'wait_p50', 'wait_p90', 'wait_p99', 'wait_p999', 'wait_max',
     'overtake_depth_p99', 'overtake_depth_max',
     'overtake_depth_p99_normalized', 'overtake_depth_max_normalized',
-] + [f'windowed_jain_{WINDOW_LABELS[w]}' for w in WINDOW_SIZES_CYCLES] \
+] + list(HANDOFF_SCALARS) + [f'windowed_jain_{WINDOW_LABELS[w]}' for w in WINDOW_SIZES_CYCLES] \
   + [f'windowed_jain_{WINDOW_COUNT_LABELS[m]}' for m in WINDOW_COUNT_MULTIPLIERS]
 
 # Scalars derivable from data/*_data.parquet alone -- no melted timeline, no
@@ -39,6 +40,9 @@ RECOMPUTABLE_SCALARS: Dict[str, Callable[[LogAnalyzer], float]] = {
     f'windowed_jain_{WINDOW_COUNT_LABELS[m]}': (lambda la, m=m: la.windowed_jain_by_count(m))
     for m in WINDOW_COUNT_MULTIPLIERS
 }
+RECOMPUTABLE_SCALARS.update({
+    name: (lambda la, name=name: la.handoff_stats()[name]) for name in HANDOFF_SCALARS
+})
 
 
 class MetricAverager:
@@ -210,6 +214,7 @@ class MetricAverager:
                 }
                 record.update(analyzer.wait_time_percentiles())
                 record.update(analyzer.overtake_depth_percentiles())
+                record.update(analyzer.handoff_stats())
                 for window in WINDOW_SIZES_CYCLES:
                     record[f'windowed_jain_{WINDOW_LABELS[window]}'] = analyzer.windowed_jain(window)
                 for mult in WINDOW_COUNT_MULTIPLIERS:

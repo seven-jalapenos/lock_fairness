@@ -1,6 +1,7 @@
 
 
 import argparse
+from itertools import product
 from pathlib import Path
 
 from analysis.log_analyzer import (WINDOW_SIZES_CYCLES, WINDOW_LABELS,
@@ -38,6 +39,11 @@ CROSS_RUN_METRICS = [
     # sample count rather than fairness; this one holds k=10*threads either way.
     f'windowed_jain_{WINDOW_COUNT_LABELS[10]}',
     'total_CS_completions',
+    # Cross-thread cost per transfer, and the same-core reacquire it's traded
+    # against -- the mechanism behind the throughput and self_transfer curves.
+    'handoff_p50',
+    'handoff_p99',
+    'self_handoff_p50',
 ]
 
 
@@ -63,11 +69,11 @@ def plot_cross_runs(runs_csv_dir: Path, figures_dir: Path) -> None:
     Deliberately unscoped: these are the comparison figures, so a sweep of one
     lock should still be drawn against everything previously measured.
 
-    Emits one figure set per (critical-section work size, pinning policy). Runs
-    at different CS lengths aren't comparable on a single line, and neither are
-    runs under different pinning policies -- pin 2 and 3 deliberately change
-    which cores contend, so pooling them would draw two different experiments as
-    one."""
+    Emits one figure set per (critical-section work size, NCS work, pinning
+    policy). Runs at different CS lengths or contention levels aren't comparable
+    on a single line, and neither are runs under different pinning policies --
+    pin 2 and 3 deliberately change which cores contend, so pooling them would
+    draw two different experiments as one."""
     plotter = CrossRunPlotter(runs_csv_dir, figures_dir).load_data()
 
     if plotter.aggregated_data.empty:
@@ -82,31 +88,33 @@ def plot_cross_runs(runs_csv_dir: Path, figures_dir: Path) -> None:
         work_values.append(None)
 
     pin_values = sorted(data['pin'].dropna().unique().tolist())
+    ncs_values = sorted(data['ncs'].dropna().unique().tolist())
 
-    for work in work_values:
+    for work, ncs, pin in product(work_values, ncs_values, pin_values):
         work_suffix = '' if work is None else f'_w{int(work)}'
-        for pin in pin_values:
-            where = {'work': work, 'pin': pin}
-            suffix = f"{work_suffix}_p{int(pin)}"
+        # ncs=0 keeps the pre-NCS filenames so existing figures are overwritten, not duplicated.
+        ncs_suffix = f'_n{int(ncs)}' if ncs else ''
+        where = {'work': work, 'ncs': ncs, 'pin': pin}
+        suffix = f"{work_suffix}{ncs_suffix}_p{int(pin)}"
 
-            # Most (work, pin) pairs in a sparse tree have no runs; skip them
-            # rather than emitting a "not found" line per metric.
-            mask = (data['pin'] == pin)
-            mask &= data['work'].isna() if work is None else (data['work'] == work)
-            if not mask.any():
-                continue
+        # Most combinations in a sparse tree have no runs; skip them rather than
+        # emitting a "not found" line per metric.
+        mask = (data['pin'] == pin) & (data['ncs'] == ncs)
+        mask &= data['work'].isna() if work is None else (data['work'] == work)
+        if not mask.any():
+            continue
 
-            for metric in CROSS_RUN_METRICS:
-                plotter.plot_metric(
-                    metric,
-                    x_axis='threads',
-                    line_axis='lock_type',
-                    save_csv=True,
-                    where=where,
-                    name_suffix=suffix
-                )
+        for metric in CROSS_RUN_METRICS:
+            plotter.plot_metric(
+                metric,
+                x_axis='threads',
+                line_axis='lock_type',
+                save_csv=True,
+                where=where,
+                name_suffix=suffix
+            )
 
-            plotter.plot_timescale(where=where, name_suffix=suffix)
+        plotter.plot_timescale(where=where, name_suffix=suffix)
 
 
 def build_parser() -> argparse.ArgumentParser:

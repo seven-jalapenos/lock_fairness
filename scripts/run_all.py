@@ -88,6 +88,11 @@ def build_parser() -> argparse.ArgumentParser:
         help='critical-section work sizes (loop iterations) to sweep'
     )
     parser.add_argument(
+        '--ncs', nargs='+', metavar='SPEC', default=['0'],
+        help='mean private (non-critical-section) work per operation, in loop '
+             'iterations; 0 keeps every thread contending (default: %(default)s)'
+    )
+    parser.add_argument(
         '--pin', nargs='+', metavar='SPEC', default=['1'],
         help='core pinning policies: 0 none, 1 round-robin, 2 one hot core, 3 half hot core'
     )
@@ -130,6 +135,7 @@ def main(argv: list[str] | None = None) -> None:
         'threads': parse_int_spec(args.threads),
         'pin': parse_int_spec(args.pin),
         'work': parse_int_spec(args.work),
+        'ncs': parse_int_spec(args.ncs),
     }
 
     # Dump a full Python traceback (all threads) on demand or on a hard crash.

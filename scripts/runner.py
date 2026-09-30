@@ -25,7 +25,8 @@ param_space = {
      'lock': ['mcs', 'clh', 'ticket', 'ttas', 'ttasb', 'tsspin'],
      'threads': list(range(1, 29)),
      'pin': [1],
-     'work': [10000]
+     'work': [10000],
+     'ncs': [0]
 }
 
 
@@ -34,8 +35,12 @@ def run_dir_id(params: dict) -> str:
 
     Work size is part of the identity: without it, re-sweeping the same
     lock/threads/pin at a different CS length would collide with the previous
-    result and be silently skipped by the resume check in _run_complete."""
-    return f"{params['lock']}_{params['threads']}_{params['pin']}_w{params['work']}"
+    result and be silently skipped by the resume check in _run_complete.
+    NCS is likewise part of it, but omitted at 0 so directories from before the
+    NCS dimension (all saturated, i.e. ncs=0) keep resuming and plotting."""
+    dir_id = f"{params['lock']}_{params['threads']}_{params['pin']}_w{params['work']}"
+    ncs = params.get('ncs', 0)
+    return f"{dir_id}_n{ncs}" if ncs else dir_id
 
 CMAKE_CACHE_PATH = 'build/CMakeCache.txt'
 LOCK_EXE = './build/bin/lock_exe'
@@ -110,6 +115,7 @@ class Runner:
         pin = self.params['pin']
         lock = self.params['lock']
         work = self.params['work']
+        ncs = self.params.get('ncs', 0)
         filename = f'{run_dir_id(self.params)}_{self.iteration_name}.bin'
         out_file = f'{self.output_dir}/{filename}'
 
@@ -126,6 +132,7 @@ class Runner:
                 str(pin),
                 lock,
                 str(work),
+                str(ncs),
                 out_file
             ], 
             check=True,

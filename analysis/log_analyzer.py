@@ -40,6 +40,10 @@ WINDOW_COUNT_MULTIPLIERS = (10,)
 # Suffixes naming the per-multiplier scalars: k10n is "k = 10 * num_threads".
 WINDOW_COUNT_LABELS = {10: 'k10n'}
 
+# Names handoff_stats() returns, in export order.
+HANDOFF_SCALARS = ('handoff_p50', 'handoff_p99', 'self_handoff_p50',
+                   'handoff_negative_fraction')
+
 # log_coverage is never exactly 1.0 on a healthy run: threads are started and
 # joined in sequence, so the last thread's first invocation trails the first
 # thread's, and the same staggering happens at the end. That costs a fraction of
@@ -60,6 +64,7 @@ class LogAnalyzer:
         # for the O(N*t) overtake scan, which this used to run unconditionally.
         self._global_timeline_cache = global_timeline
         self._overtake_timeline_cache = overtake_timeline
+        self._handoff_stats_cache: Optional[Dict[str, float]] = None
         self.num_threads = self._resolve_num_threads(data, num_threads)
         self.operation_count = len(data)
 
@@ -116,6 +121,7 @@ class LogAnalyzer:
         self._data = None
         self._global_timeline_cache = None
         self._overtake_timeline_cache = None
+        self._handoff_stats_cache = None
         return False
 
     def create_overtake_timeline(self) -> pd.DataFrame:
@@ -637,6 +643,70 @@ class LogAnalyzer:
         sq = (counts ** 2).sum(axis=1)
         per_window = (counts.sum(axis=1) ** 2) / (counts.shape[1] * sq)
         return float(np.mean(per_window))
+
+    def handoff_stats(self) -> Dict[str, float]:
+        """
+        Release-to-next-acquisition latency, over handoffs to a thread that was
+        already waiting.
+
+        This is what a lock costs per transfer, the axis throughput differences
+        at fixed `work` come from. Throughput alone can't show it once NCS work
+        is in play, since gaps between acquisitions then mix handoffs with idle
+        time -- hence only contended pairs: a cross-thread handoff counts when the
+        next acquirer had invoked by the release, a self-handoff when some other
+        thread was pending at it. A thread can't be waiting at its own release,
+        so the second is what barging means.
+
+        Self-handoffs are reported apart: they never leave the core, so pooling
+        them would rank a barging lock as the cheapest. handoff_negative_fraction
+        is a validity guard: mutual exclusion makes a cross-thread handoff
+        negative impossible in real time, so its share measures cross-core
+        calibration error -- high for pin-0 runs and runs predating the offset
+        fix, whose latencies shouldn't be trusted.
+
+        Memoized so the recompute table's per-name lambdas share one sort.
+        """
+        if self._handoff_stats_cache is not None:
+            return self._handoff_stats_cache
+
+        nan = float('nan')
+        stats = {name: nan for name in HANDOFF_SCALARS}
+        assert(self._data is not None)
+        if len(self._data) >= 2:
+            # Same acquisition ordering as windowed_jain_by_count: the flat frame,
+            # no timeline.
+            ordered = self._data[['thread_id', 'invocation', 'acquisition', 'release']] \
+                .sort_values('acquisition', kind='stable')
+            # int64 so a calibration-skewed handoff shows up negative instead of
+            # wrapping to ~1.8e19.
+            inv = ordered['invocation'].to_numpy().astype(np.int64)
+            acq = ordered['acquisition'].to_numpy().astype(np.int64)
+            rel = ordered['release'].to_numpy().astype(np.int64)
+            tid = ordered['thread_id'].to_numpy()
+
+            prev_rel = rel[:-1]
+            latency = acq[1:] - prev_rel
+            same = tid[1:] == tid[:-1]
+
+            # Operations pending at release k-1: invoked by then, minus the k
+            # already acquired. Op k is never among them on a self pair (its
+            # thread re-invokes after releasing), so > 0 means another thread
+            # was waiting.
+            invoked = np.searchsorted(np.sort(inv), prev_rel, side='right')
+            others_waiting = invoked - np.arange(1, prev_rel.size + 1) > 0
+
+            cross = latency[~same & (inv[1:] <= prev_rel)]
+            own = latency[same & others_waiting]
+            if cross.size:
+                p50, p99 = np.percentile(cross, [50, 99])
+                stats['handoff_p50'] = float(p50)
+                stats['handoff_p99'] = float(p99)
+                stats['handoff_negative_fraction'] = float(np.mean(cross < 0))
+            if own.size:
+                stats['self_handoff_p50'] = float(np.median(own))
+
+        self._handoff_stats_cache = stats
+        return stats
 
     def lock_transfer_matrix(self) -> np.ndarray:
         """

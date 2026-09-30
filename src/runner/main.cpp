@@ -59,7 +59,7 @@ std::unique_ptr<std::barrier<>> sync_point; // will be re-initialized in main wi
 // each thread will perform the following steps:
 // 1. sync on barrier
 // 2. warmup phase with nops until main thread signals start
-// 3. benchmark phase: repeatedly acquire the lock, simulate work, release lock
+// 3. benchmark phase: repeatedly acquire the lock, simulate work, release lock, do private (NCS) work
 //   - timestamps are recorded immediately before lock invocation, immediately after lock acquisition, and immediately before lock release
 // Simulated critical section. The empty asm consumes x so the loop survives -O3;
 // `iterations` is the CS length knob driven from the command line.
@@ -71,12 +71,31 @@ static inline __attribute__((always_inline)) void simulate_work(int iterations) 
     asm volatile("" :: "r"(x));
 }
 
-void worker(int thread_id, int core_id, Lock* lock, int iterations) {
+// Private work between release and the next invocation, so contention is a knob
+// (NCS/CS ratio) rather than pinned at saturation. Jittered uniformly over
+// [ncs/2, 3ncs/2]: a fixed length phase-locks threads under a FIFO lock into an
+// artificial convoy. Thread-local xorshift so it touches no shared state.
+struct NcsGen {
+    uint64_t state;
+    int base, span;
+    NcsGen(int thread_id, int ncs)
+        : state(0x9E3779B97F4A7C15ULL * (thread_id + 1)), base(ncs - ncs / 2), span(ncs + 1) {}
+    int next() {
+        if (span <= 1) return 0;
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        return base + (int)(state % (uint64_t)span);
+    }
+};
+
+void worker(int thread_id, int core_id, Lock* lock, int iterations, int ncs) {
     init_thread_log();
     if (core_id >= 0) {
         pin_thread_to_core(core_id);
     }
     uint32_t aux;
+    NcsGen ncs_gen(thread_id, ncs);
     // phase 0: sync threads
     sync_point->arrive_and_wait();
     // phase 1: warmup
@@ -86,6 +105,7 @@ void worker(int thread_id, int core_id, Lock* lock, int iterations) {
         simulate_work(iterations);
         COMPILER_BARRIER();
         lock->unlock();
+        simulate_work(ncs_gen.next());
     }
     // phase 2: benchmark
     while(!stop.load(std::memory_order_relaxed)) {
@@ -111,6 +131,8 @@ void worker(int thread_id, int core_id, Lock* lock, int iterations) {
         lock->unlock();        
 
         log_event(lock_invoke, lock_acquire, lock_release);
+
+        simulate_work(ncs_gen.next());
     }
 
     finalize_thread_log(thread_id);
@@ -118,7 +140,7 @@ void worker(int thread_id, int core_id, Lock* lock, int iterations) {
 
 /////////////////////////////////////////////////////////////
 //
-//      ARGS: [num_threads(>0)] [core_pin_policy] [lock_type] [work] [filename(optional)]
+//      ARGS: [num_threads(>0)] [core_pin_policy] [lock_type] [work] [ncs] [filename(optional)]
 //      
 //      num_threads: number of worker threads to spawn
 //      core_pin_policy: 0 (no pinning)
@@ -137,10 +159,13 @@ void worker(int thread_id, int core_id, Lock* lock, int iterations) {
 // 
 //      work: number of iterations of busy-work in the critical section
 //
+//      ncs: mean iterations of private work after each release (0 = saturated,
+//           every thread re-requests immediately); jittered +-50% per operation
+//
 //      filename: name of output binary log file (optional, if not provided, will be generated based on other parameters)
 //
 //      Run with all or no arguments
-//      If run with no arguments, defaults to 8 threads, round-robin pinning, MCS lock and 10000 iterations.
+//      If run with no arguments, defaults to 8 threads, round-robin pinning, MCS lock, 10000 iterations and no NCS work.
 //
 //      lock_exe --calibrate-only
 //          Re-measures the per-core TSC offsets into files/rdtsc_offsets.txt and
@@ -149,6 +174,26 @@ void worker(int thread_id, int core_id, Lock* lock, int iterations) {
 //          every run paying for it.
 //
 //
+
+// Strict non-negative integer parse; a stray path in a numeric slot must error
+// rather than atoi to 0 and silently run the wrong experiment.
+static bool parse_count_arg(const std::string& arg, const char* name, int& out) {
+    size_t consumed = 0;
+    bool valid = !arg.empty();
+    if (valid) {
+        try {
+            out = std::stoi(arg, &consumed);
+        } catch (const std::exception&) {
+            valid = false;
+        }
+    }
+    if (!valid || consumed != arg.size() || out < 0) {
+        std::cerr << "Invalid " << name << " argument: " << arg << "\n"
+                  << "Usage: lock_exe [num_threads] [core_pin_policy] [lock_type] [work] [ncs] [filename(optional)]\n";
+        return false;
+    }
+    return true;
+}
 
 int main(int argc, char* argv[]) {
     // Calibration-only mode: measure the per-core TSC offsets, write them, and
@@ -164,6 +209,7 @@ int main(int argc, char* argv[]) {
     int pin = 1;
     std::string lock_type = "mcs";
     int work = 10000;
+    int ncs = 0;
     std::string filename;
     // parse arguments
     if (argc >= 4) {
@@ -174,31 +220,22 @@ int main(int argc, char* argv[]) {
     // argv[4] used to be the output filename; it is now the CS work size. Reject a
     // non-numeric value outright rather than letting atoi turn a stale 4-arg
     // invocation into a silent zero-work run written to the fallback path.
-    if (argc >= 5) {
-        std::string work_arg = argv[4];
-        size_t consumed = 0;
-        bool valid = !work_arg.empty();
-        if (valid) {
-            try {
-                work = std::stoi(work_arg, &consumed);
-            } catch (const std::exception&) {
-                valid = false;
-            }
-        }
-        if (!valid || consumed != work_arg.size() || work < 0) {
-            std::cerr << "Invalid work argument: " << work_arg << "\n"
-                      << "Usage: lock_exe [num_threads] [core_pin_policy] [lock_type] [work] [filename(optional)]\n";
-            return 1;
-        }
+    // argv[5] was likewise the filename before ncs took its slot.
+    if (argc >= 5 && !parse_count_arg(argv[4], "work", work)) {
+        return 1;
+    }
+    if (argc >= 6 && !parse_count_arg(argv[5], "ncs", ncs)) {
+        return 1;
     }
     // set filename
-    if (argc >= 6) {
-        filename = argv[5];
+    if (argc >= 7) {
+        filename = argv[6];
     } else {
         filename = LOG_DIR + "log_" + lock_type +
                    "_" + std::to_string(num_threads) +
                    "threads_pin" + std::to_string(pin) +
-                   "_w" + std::to_string(work) + ".bin";
+                   "_w" + std::to_string(work) +
+                   "_n" + std::to_string(ncs) + ".bin";
     }
 
     // set pinning policy and generate core ids for each thread
@@ -273,7 +310,7 @@ int main(int argc, char* argv[]) {
     logging_init(num_threads, per_thread);
 
     for (int i = 0; i < num_threads; i++) {
-        threads.emplace_back(worker, i, core_ids[i], lock.get(), work);
+        threads.emplace_back(worker, i, core_ids[i], lock.get(), work, ncs);
     }
     // warmup phase
     std::this_thread::sleep_for(std::chrono::seconds(WARMUP));
